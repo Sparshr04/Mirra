@@ -1,0 +1,16 @@
+device: mps
+resolution: 512
+stride: 5
+data:
+  raw: data/raw
+  processed: data/processed
+outputs:
+  geometry: outputs/geometry
+  semantics: outputs/semantics
+  final: outputs/final
+checkpoints: checkpoints
+sam2:
+  checkpoint_path: checkpoints/sam2_hiera_large.pt
+  model_cfg: sam2_hiera_l.yaml
+depth_model:
+  type: midas

@@ -1,0 +1,30 @@
+# Core Scientific Stack
+numpy>=1.24.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+pyyaml>=6.0
+
+# Computer Vision & Geometry
+opencv-python>=4.8.0
+open3d>=0.17.0  # Check compatibility with Apple Silicon, usually works well via pip now
+
+# Configuration Management
+hydra-core>=1.3.2
+
+# PyTorch (Apple Silicon / MPS Support)
+# It is often best to install specific nightly or steady builds depending on the exact OS version.
+# For general compatibility with recent torch versions (2.0+) which support MPS:
+--pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cpu
+# Note: The above line is a pip indicator for the index.
+# If copying this into a generic requirements files, sometimes --extra-index-url is preferred or needed separately.
+# For strictly requirements.txt standard usage without flags usually:
+# torch
+# torchvision
+# But for "Critical: Specify torch and torchvision with nightly builds or stable versions that support mps"
+# providing the command or the specific version is safer.
+# Below is a standard setup that usually picks up the correct wheel for arm64 macos if available,
+# but for explicit nightly usage, it's often a separate command.
+# Let's provide a standard compatible set, and comments for nightly if needed.
+
+torch>=2.1.0
+torchvision>=0.16.0

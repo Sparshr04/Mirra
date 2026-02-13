@@ -28,3 +28,12 @@ hydra-core>=1.3.2
 
 torch>=2.1.0
 torchvision>=0.16.0
+
+# DUSt3R Dependencies
+roma
+scipy
+einops
+trimesh
+huggingface-hub[torch]>=0.22
+tensorboard
+pyglet<2

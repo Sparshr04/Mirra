@@ -16,11 +16,11 @@ def setup_dust3r():
     Checks for 'dust3r' directory. If not found, clones it.
     Adds it to sys.path.
     """
-    project_root = (
-        hydra.utils.get_original_cwd()
-        if hasattr(hydra.utils, "get_original_cwd")
-        else os.getcwd()
-    )
+    # Find project root relative to this file (assuming src/geometry_engine.py)
+    # This avoids using hydra before initialization
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+
     dust3r_path = os.path.join(project_root, "dust3r")
 
     if not os.path.exists(dust3r_path):

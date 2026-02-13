@@ -4,7 +4,7 @@
 device: "mps"  # Metal Performance Shaders for Apple Silicon
 
 # Reconstruction Parameters
-resolution: 512
+resolution: 384 #512
 stride: 5
 
 # Paths
@@ -19,10 +19,19 @@ outputs:
 
 checkpoints: "checkpoints"
 
-# Model Parameters (Placeholders for now)
-sam2:
+# Semantics
+semantics:
+  model_type: "sam2_hiera_large"
+  min_mask_region_area: 100
   checkpoint_path: "checkpoints/sam2_hiera_large.pt"
-  model_cfg: "sam2_hiera_l.yaml"
+  config_path: "sam2_hiera_l.yaml"
 
 depth_model:
   type: "midas" # Example
+
+# Unified Dataset Paths (single source of truth for both engines)
+dataset:
+  raw_video_dir: "data/raw"
+  processed_frames_dir: "data/processed/frames"
+  video_filename: ""  # Leave empty to auto-detect first video in raw_video_dir
+  force_reprocess: false  # Set to true to always re-extract frames

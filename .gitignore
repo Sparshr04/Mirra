@@ -6,7 +6,7 @@ dist/
 wheels/
 *.egg-info
 .python-version
-
+.DS_Store
 
 # Virtual environments
 .venv
@@ -14,3 +14,6 @@ wheels/
 # Data Paths
 data/
 checkpoints/
+outputs/
+
+USAGE.md

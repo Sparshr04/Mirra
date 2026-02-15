@@ -168,11 +168,52 @@ class FusionEngine:
         """
         Save point cloud with custom 'label_id' scalar field.
         Uses binary PLY format for efficiency.
+        Includes NaN/Inf filtering and bounds checking.
         """
         print(f"Saving semantic point cloud to {output_path}...")
 
-        n = len(points)
+        # ─── SANITIZATION: Remove NaN/Inf points ─────────────────────
+        valid_mask = np.isfinite(points).all(axis=1)
+        invalid_count = (~valid_mask).sum()
 
+        if invalid_count > 0:
+            print(f"⚠️  Removed {invalid_count} points with NaN/Inf coordinates")
+
+        points = points[valid_mask]
+        colors = colors[valid_mask]
+        labels = labels[valid_mask]
+
+        n = len(points)
+        if n == 0:
+            print("❌ ERROR: No valid points to save after filtering!")
+            return
+
+        # ─── TYPE SAFETY ───────────────────────────────────────
+        # Convert colors [0,1] → [0,255]
+        colors_255 = np.clip(colors * 255, 0, 255).astype(np.uint8)
+        # Ensure labels are int32
+        labels = labels.astype(np.int32)
+
+        # ─── BOUNDS CHECK ────────────────────────────────────────
+        x_min, y_min, z_min = points.min(axis=0)
+        x_max, y_max, z_max = points.max(axis=0)
+
+        print(f"Points: {n}")
+        print(
+            f"Bounds: X=[{x_min:.3f}, {x_max:.3f}] "
+            f"Y=[{y_min:.3f}, {y_max:.3f}] "
+            f"Z=[{z_min:.3f}, {z_max:.3f}]"
+        )
+
+        # Warn if bounds are suspiciously large
+        max_extent = max(x_max - x_min, y_max - y_min, z_max - z_min)
+        if max_extent > 1e6:
+            print(
+                f"⚠️  WARNING: Point cloud extent is {max_extent:.2e}. "
+                "This may cause rendering issues!"
+            )
+
+        # ─── PLY EXPORT ─────────────────────────────────────────
         # PLY header with label_id property
         header = f"""ply
 format binary_little_endian 1.0
@@ -186,8 +227,6 @@ property uchar blue
 property int label_id
 end_header
 """
-        # Convert colors [0,1] → [0,255]
-        colors_255 = (colors * 255).astype(np.uint8)
 
         # Write binary PLY
         with open(output_path, "wb") as f:

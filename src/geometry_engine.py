@@ -302,27 +302,27 @@ class GeometryEngine:
         return frames
 
     def run_inference(self, frames):
-        """Runs DUSt3R inference on the extracted frames with checkpointing."""
-        cache_path = os.path.join(self.cache_dir, "pairwise_state.pt")
+        """Runs DUSt3R inference on the extracted frames with output-based skip."""
+        geo_dir = os.path.abspath(
+            os.path.join(self.project_root, "outputs", "geometry")
+        )
+        ply_path = os.path.join(geo_dir, "reconstruction.ply")
+        poses_path = os.path.join(geo_dir, "poses.npz")
         resume = self.cfg.get("resume", True)
 
-        # ─── PART A: PAIRWISE INFERENCE ──────────────────────────────────
-        if resume and os.path.exists(cache_path):
-            print(f">> Found cached pairwise inference. Loading from {cache_path}...")
-            try:
-                checkpoint = torch.load(cache_path, map_location=self.device)
-                output = checkpoint["output"]
-                print("✅ Pairwise state loaded from cache.")
-            except Exception as e:
-                print(f"⚠️  Cache load failed ({e}). Re-running pairwise inference...")
-                output = self._run_pairwise_inference(frames)
-                self._save_pairwise_cache(output, cache_path)
-        else:
-            output = self._run_pairwise_inference(frames)
-            if resume:
-                self._save_pairwise_cache(output, cache_path)
+        # ─── SKIP LOGIC: Check if outputs already exist ────────────────────
+        if resume and os.path.exists(ply_path) and os.path.exists(poses_path):
+            print(">> Found completed geometry output. Skipping inference.")
+            print(f"   PLY: {ply_path}")
+            print(f"   Poses: {poses_path}")
+            print("   (Delete these files to re-run DUSt3R)")
+            # Return a mock scene object - won't be used since outputs exist
+            return None
 
-        # ─── PART B: GLOBAL ALIGNMENT ────────────────────────────────────
+        # ─── PART A: PAIRWISE INFERENCE ─────────────────────────────────
+        output = self._run_pairwise_inference(frames)
+
+        # ─── PART B: GLOBAL ALIGNMENT ───────────────────────────────────
         print("Running Global Alignment...")
         scene = global_aligner(output, device=self.device, optimize_pp=False)
 
@@ -381,25 +381,6 @@ class GeometryEngine:
         print("✅ Pairwise inference complete.")
         return output
 
-    def _save_pairwise_cache(self, output, cache_path):
-        """Save pairwise inference output to cache."""
-        print(f"Saving pairwise state to {cache_path}...")
-        try:
-            # Move tensors to CPU before saving to reduce file size
-            output_cpu = [
-                {
-                    k: v.cpu() if isinstance(v, torch.Tensor) else v
-                    for k, v in pair.items()
-                }
-                for pair in output
-            ]
-
-            torch.save({"output": output_cpu}, cache_path)
-            file_size = os.path.getsize(cache_path)
-            print(f"✅ Pairwise cache saved ({file_size / 1024 / 1024:.1f} MB)")
-        except Exception as e:
-            print(f"⚠️  Failed to save cache: {e}")
-
     def _save_camera_poses(self, scene, frames_dir):
         """Extract and save camera poses from DUSt3R scene."""
         geo_dir = os.path.abspath(
@@ -441,6 +422,11 @@ class GeometryEngine:
 
     def save_outputs(self, scene, frames):
         """Saves the point cloud (.ply) and depth visualization (.png)."""
+        # Skip if inference was bypassed (outputs already exist)
+        if scene is None:
+            print(">> Outputs already exist. Skipping save_outputs.")
+            return
+
         geo_dir = os.path.abspath(
             os.path.join(self.project_root, "outputs", "geometry")
         )

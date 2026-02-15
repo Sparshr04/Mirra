@@ -5,7 +5,7 @@ device: "mps"  # Metal Performance Shaders for Apple Silicon
 
 # Reconstruction Parameters
 resolution: 384 #512
-stride: 5
+stride: 200
 
 # Paths
 data:
@@ -35,3 +35,6 @@ dataset:
   processed_frames_dir: "data/processed/frames"
   video_filename: ""  # Leave empty to auto-detect first video in raw_video_dir
   force_reprocess: false  # Set to true to always re-extract frames
+
+# Geometry Engine Checkpointing
+resume: true  # Enable caching of pairwise inference (skip on OOM resume)

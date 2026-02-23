@@ -44,7 +44,7 @@ from fastapi.staticfiles import StaticFiles
 from omegaconf import OmegaConf
 from pydantic import BaseModel, Field
 
-#  Logging 
+#  Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mirra.api")
 
-# Project Root 
+# Project Root
 # server.py lives at <root>/src/api/server.py  →  root is two levels up.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
@@ -62,15 +62,14 @@ FINAL_DIR = PROJECT_ROOT / "outputs" / "final"
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 FINAL_DIR.mkdir(parents=True, exist_ok=True)
 
-# Sys-path so src.* imports work 
+# Sys-path so src.* imports work
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Job Store 
+# Job Store
 # Keyed by job_id (str UUID).  Values are JobStatus dicts.
 # Replace with a proper DB for production use.
 JOBS: Dict[str, dict] = {}
-
 
 
 class HealthResponse(BaseModel):
@@ -144,7 +143,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static File Mounts 
+# Static File Mounts
 # /files/outputs → outputs/final/  (serves .ply, .json results)
 # /files/raw     → data/raw/       (serves uploaded videos)
 app.mount("/files/outputs", StaticFiles(directory=str(FINAL_DIR)), name="outputs")
@@ -250,7 +249,7 @@ def _run_pipeline(job_id: str, video_filename: str) -> None:
         JOBS[job_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
 
 
-# 1. Health Check 
+# 1. Health Check
 @app.get(
     "/",
     response_model=HealthResponse,
@@ -264,14 +263,14 @@ async def health_check() -> HealthResponse:
     """
     return HealthResponse()
 
+    # Upload Video
+    ("/api/v1/upload",)
+    response_model = (UploadResponse,)
+    status_code = (status.HTTP_201_CREATED,)
+    summary = ("Upload a video file",)
+    tags = (["Pipeline"],)
 
-# Upload Video 
-    "/api/v1/upload",
-    response_model=UploadResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload a video file",
-    tags=["Pipeline"],
-)
+
 async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
     """
     Accepts a multipart video upload.
@@ -326,14 +325,14 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
         size_bytes=file_size,
     )
 
+    # Trigger Pipeline
+    ("/api/v1/process",)
+    response_model = (ProcessResponse,)
+    status_code = (status.HTTP_202_ACCEPTED,)
+    summary = ("Enqueue the ML pipeline for a video",)
+    tags = (["Pipeline"],)
 
-# Trigger Pipeline 
-    "/api/v1/process",
-    response_model=ProcessResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    summary="Enqueue the ML pipeline for a video",
-    tags=["Pipeline"],
-)
+
 async def process_video(
     body: ProcessRequest,
     background_tasks: BackgroundTasks,
@@ -372,13 +371,13 @@ async def process_video(
     logger.info("Job %s enqueued for '%s'.", job_id, body.filename)
     return ProcessResponse(job_id=job_id)
 
+    # ── 4. Job Status
+    ("/api/v1/status/{job_id}",)
+    response_model = (JobStatusResponse,)
+    summary = ("Poll the status of an enqueued job",)
+    tags = (["Pipeline"],)
 
-# ── 4. Job Status 
-    "/api/v1/status/{job_id}",
-    response_model=JobStatusResponse,
-    summary="Poll the status of an enqueued job",
-    tags=["Pipeline"],
-)
+
 async def get_job_status(job_id: str) -> JobStatusResponse:
     """
     Returns the current state of a pipeline job.

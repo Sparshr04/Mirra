@@ -127,6 +127,10 @@ class GeometryEngine:
             print(f"Error loading model: {e}")
             raise e
 
+        # Create cache directory for checkpointing
+        self.cache_dir = os.path.join(self.project_root, "outputs", "geometry", "cache")
+        os.makedirs(self.cache_dir, exist_ok=True)
+
     def _get_device(self):
         """Check for MPS availability and return the appropriate device."""
         if torch.backends.mps.is_available() and self.cfg.device == "mps":
@@ -298,8 +302,57 @@ class GeometryEngine:
         return frames
 
     def run_inference(self, frames):
-        """Runs DUSt3R inference on the extracted frames."""
-        print("Running DUSt3R inference...")
+        """Runs DUSt3R inference on the extracted frames with output-based skip."""
+        geo_dir = os.path.abspath(
+            os.path.join(self.project_root, "outputs", "geometry")
+        )
+        ply_path = os.path.join(geo_dir, "reconstruction.ply")
+        poses_path = os.path.join(geo_dir, "poses.npz")
+        resume = self.cfg.get("resume", True)
+
+        # ─── SKIP LOGIC: Check if outputs already exist ────────────────────
+        if resume and os.path.exists(ply_path) and os.path.exists(poses_path):
+            print(">> Found completed geometry output. Skipping inference.")
+            print(f"   PLY: {ply_path}")
+            print(f"   Poses: {poses_path}")
+            print("   (Delete these files to re-run DUSt3R)")
+            # Return a mock scene object - won't be used since outputs exist
+            return None
+
+        # ─── PART A: PAIRWISE INFERENCE ─────────────────────────────────
+        output = self._run_pairwise_inference(frames)
+
+        # ─── PART B: GLOBAL ALIGNMENT ───────────────────────────────────
+        print("Running Global Alignment...")
+        scene = global_aligner(output, device=self.device, optimize_pp=False)
+
+        # Try on MPS first, fallback to CPU on OOM
+        try:
+            scene.compute_global_alignment(
+                init="mst", niter=300, schedule="linear", lr=0.01
+            )
+            print(f"✅ Global alignment complete on {self.device}.")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "mps" in str(e).lower():
+                print(
+                    "⚠️  OOM detected on MPS. Moving scene to CPU for Global Alignment..."
+                )
+                print("   (This will be slower but won't crash)")
+
+                # Move to CPU and retry
+                scene = scene.to("cpu")
+                scene.compute_global_alignment(
+                    init="mst", niter=300, schedule="linear", lr=0.01
+                )
+                print("✅ Global alignment complete on CPU (OOM fallback).")
+            else:
+                raise  # Re-raise if it's a different error
+
+        return scene
+
+    def _run_pairwise_inference(self, frames):
+        """Run the pairwise inference stage (expensive part)."""
+        print("Running DUSt3R pairwise inference...")
 
         normalize = tvf.Compose(
             [tvf.ToTensor(), tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
@@ -325,18 +378,55 @@ class GeometryEngine:
 
         # batch_size=1 is crucial for MPS memory safety
         output = inference(pairs, self.model, self.device, batch_size=1)
+        print("✅ Pairwise inference complete.")
+        return output
 
-        # Global Align
-        print("Running Global Alignment...")
-        scene = global_aligner(output, device=self.device, optimize_pp=False)
-        scene.compute_global_alignment(
-            init="mst", niter=300, schedule="linear", lr=0.01
+    def _save_camera_poses(self, scene, frames_dir):
+        """Extract and save camera poses from DUSt3R scene."""
+        geo_dir = os.path.abspath(
+            os.path.join(self.project_root, "outputs", "geometry")
+        )
+        poses_path = os.path.join(geo_dir, "poses.npz")
+        print(f"Saving camera poses to {poses_path}...")
+
+        # Extract camera-to-world matrices and focals from scene
+        c2w = _to_numpy(scene.get_im_poses())  # (N, 4, 4)
+        focals = _to_numpy(scene.get_focals())  # (N,) or (N, 2)
+
+        # Handle focal length format: if 2D, take average
+        if focals.ndim == 2:
+            focals = focals.mean(axis=1)
+
+        # Get image names and shapes
+        image_names = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+
+        # Get image shapes from scene.imgs
+        imgs_list = scene.imgs
+        image_shapes = []
+        for img in imgs_list:
+            img_np = _to_numpy(img)
+            h, w = img_np.shape[:2]
+            image_shapes.append([h, w])
+        image_shapes = np.array(image_shapes)
+
+        # Save to npz
+        np.savez_compressed(
+            poses_path,
+            c2w=c2w,
+            focals=focals,
+            image_names=np.array(image_names),
+            image_shapes=image_shapes,
         )
 
-        return scene
+        print(f"✅ Camera poses saved: {poses_path} ({len(image_names)} cameras)")
 
     def save_outputs(self, scene, frames):
         """Saves the point cloud (.ply) and depth visualization (.png)."""
+        # Skip if inference was bypassed (outputs already exist)
+        if scene is None:
+            print(">> Outputs already exist. Skipping save_outputs.")
+            return
+
         geo_dir = os.path.abspath(
             os.path.join(self.project_root, "outputs", "geometry")
         )
@@ -411,6 +501,12 @@ class GeometryEngine:
             print(f"✅ Visualization saved: {viz_path}")
         except Exception as e:
             print(f"❌ Error saving visualization: {e}")
+
+        # ── 3. Save Camera Poses ──────────────────────────────────────────
+        frames_dir = os.path.join(
+            self.project_root, self.cfg.dataset.processed_frames_dir
+        )
+        self._save_camera_poses(scene, frames_dir)
 
 
 @hydra.main(version_base=None, config_path="../", config_name="config")

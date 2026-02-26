@@ -316,6 +316,9 @@ class GeometryEngine:
 
         # ─── PART A: PAIRWISE INFERENCE ─────────────────────────────────
         output = self._run_pairwise_inference(frames)
+        # FLUSH VRAM: The pairwise output is huge. Clear the cache before alignment.
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
         # ─── PART B: GLOBAL ALIGNMENT ───────────────────────────────────
         print("Running Global Alignment...")
@@ -323,6 +326,7 @@ class GeometryEngine:
 
         # Try on MPS first, fallback to CPU on OOM
         try:
+            scene = global_aligner(output, device=self.device, optimize_pp=False)
             scene.compute_global_alignment(
                 init="mst", niter=300, schedule="linear", lr=0.01
             )
@@ -330,12 +334,16 @@ class GeometryEngine:
         except RuntimeError as e:
             if "out of memory" in str(e).lower() or "mps" in str(e).lower():
                 print(
-                    "⚠️  OOM detected on MPS. Moving scene to CPU for Global Alignment..."
+                    "⚠️  OOM detected on GPU. Moving scene to CPU for Global Alignment..."
                 )
                 print("   (This will be slower but won't crash)")
 
-                # Move to CPU and retry
-                scene = scene.to("cpu")
+                # Flush the failed GPU memory
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+
+                # Re-initialize the aligner forcefully on the CPU
+                scene = scene.to("cpu", optimize_pp=False)
                 scene.compute_global_alignment(
                     init="mst", niter=300, schedule="linear", lr=0.01
                 )

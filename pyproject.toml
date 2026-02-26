@@ -27,3 +27,12 @@ dependencies = [
     "trimesh>=4.11.2",
     "python-multipart>=0.0.22",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }

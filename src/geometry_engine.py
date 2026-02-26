@@ -15,6 +15,9 @@ import open3d as o3d
 import argparse
 import torchvision.transforms as tvf
 
+# Hardware abstraction — single source of truth for device and dtype
+from src.config import DEVICE
+
 
 # --- Dependency Management ---
 def setup_dust3r():
@@ -90,7 +93,8 @@ def _to_numpy(x):
 class GeometryEngine:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
-        self.device = self._get_device()
+        # Use the globally detected device from src.config
+        self.device = DEVICE
         print(f"GeometryEngine initialized on device: {self.device}")
 
         self.project_root = (
@@ -130,15 +134,6 @@ class GeometryEngine:
         # Create cache directory for checkpointing
         self.cache_dir = os.path.join(self.project_root, "outputs", "geometry", "cache")
         os.makedirs(self.cache_dir, exist_ok=True)
-
-    def _get_device(self):
-        """Check for MPS availability and return the appropriate device."""
-        if torch.backends.mps.is_available() and self.cfg.device == "mps":
-            return "mps"
-        elif torch.cuda.is_available() and self.cfg.device == "cuda":
-            return "cuda"
-        else:
-            return "cpu"
 
     def _find_video(self):
         """

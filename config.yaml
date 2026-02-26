@@ -1,11 +1,11 @@
 # Configuration for Semantic World Reconstruction Pipeline
 
 # Hardware / Compute
-device: "mps"  # Metal Performance Shaders for Apple Silicon
+device: "auto"  # Auto-detected at runtime in src/config.py (cuda > mps > cpu)
 
 # Reconstruction Parameters
 resolution: 512 #512
-stride: 100
+stride: 150
 
 # Paths
 data:

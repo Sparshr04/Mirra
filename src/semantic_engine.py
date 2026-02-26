@@ -1,3 +1,4 @@
+import contextlib
 import os
 import sys
 import subprocess
@@ -11,6 +12,9 @@ import cv2
 import hydra
 from omegaconf import DictConfig
 from tqdm import tqdm
+
+# Hardware abstraction — single source of truth for device and dtype
+from src.config import DEVICE, DTYPE
 
 
 # --- Dependency Management ---
@@ -79,8 +83,12 @@ except ImportError as e:
 class SemanticEngine:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
-        self.device = self._get_device()
-        print(f"SemanticEngine initialized on device: {self.device}")
+        # Use the globally detected device and dtype from src.config
+        self.device = DEVICE
+        self.dtype = DTYPE
+        print(
+            f"SemanticEngine initialized on device: {self.device}, dtype: {self.dtype}"
+        )
 
         self.project_root = (
             hydra.utils.get_original_cwd()
@@ -105,11 +113,15 @@ class SemanticEngine:
             self.video_predictor = build_sam2_video_predictor(
                 self.model_cfg, self.checkpoint_path, device=self.device
             )
+            # Cast to DTYPE: float16 on CUDA for Tensor Core throughput;
+            # float32 on MPS/CPU to avoid compatibility issues.
+            self.video_predictor = self.video_predictor.to(self.dtype)
 
             # Initialize Image Model for Automatic Mask Generation (on frame 0)
             self.image_model = build_sam2(
                 self.model_cfg, self.checkpoint_path, device=self.device
             )
+            self.image_model = self.image_model.to(self.dtype)
             self.mask_generator = SAM2AutomaticMaskGenerator(self.image_model)
 
             print("SAM 2 Models loaded successfully.")
@@ -117,13 +129,15 @@ class SemanticEngine:
             print(f"Error loading SAM 2 models: {e}")
             raise e
 
-    def _get_device(self):
-        if torch.backends.mps.is_available() and self.cfg.device == "mps":
-            return "mps"
-        elif torch.cuda.is_available() and self.cfg.device == "cuda":
-            return "cuda"
-        else:
-            return "cpu"
+    def _autocast_ctx(self) -> contextlib.AbstractContextManager:
+        """
+        Return torch.autocast on CUDA for float16 Tensor Core throughput.
+        On MPS or CPU, return a no-op nullcontext so the same code path
+        runs on all platforms without any explicit branching at call sites.
+        """
+        if self.device == "cuda":
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return contextlib.nullcontext()
 
     def _download_checkpoint(self):
         if not os.path.exists(self.checkpoint_path):
@@ -302,7 +316,9 @@ class SemanticEngine:
         image0 = cv2.imread(frame0_path)
         image0 = cv2.cvtColor(image0, cv2.COLOR_BGR2RGB)
 
-        masks0 = self.mask_generator.generate(image0)
+        # --- Mask generation wrapped in autocast for CUDA, no-op elsewhere ---
+        with self._autocast_ctx():
+            masks0 = self.mask_generator.generate(image0)
         print(f"Found {len(masks0)} objects in Frame 0.")
 
         # Filter tiny masks
@@ -336,17 +352,23 @@ class SemanticEngine:
                 for i, obj_id in enumerate(final_out_obj_ids)
             }
 
-        # 5. Propagate
+        # 5. Propagate — wrapped in autocast for CUDA throughput
         print("Propagating masks through video...")
-        for (
-            out_frame_idx,
-            out_obj_ids,
-            out_mask_logits,
-        ) in self.video_predictor.propagate_in_video(inference_state):
-            output_masks[out_frame_idx] = {
-                obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, obj_id in enumerate(out_obj_ids)
-            }
+        with self._autocast_ctx():
+            for (
+                out_frame_idx,
+                out_obj_ids,
+                out_mask_logits,
+            ) in self.video_predictor.propagate_in_video(inference_state):
+                output_masks[out_frame_idx] = {
+                    obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, obj_id in enumerate(out_obj_ids)
+                }
+
+        # Flush VRAM after a full video pass to prevent memory leaks on CUDA.
+        # Silently skipped on MPS and CPU where it is not applicable.
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
         return output_masks, frames_dir
 

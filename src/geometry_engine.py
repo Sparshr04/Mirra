@@ -305,51 +305,50 @@ class GeometryEngine:
         poses_path = os.path.join(geo_dir, "poses.npz")
         resume = self.cfg.get("resume", True)
 
-        # ─── SKIP LOGIC: Check if outputs already exist ────────────────────
+        # ─── SKIP LOGIC ────────────────────────────────────────────────
         if resume and os.path.exists(ply_path) and os.path.exists(poses_path):
             print(">> Found completed geometry output. Skipping inference.")
-            print(f"   PLY: {ply_path}")
-            print(f"   Poses: {poses_path}")
-            print("   (Delete these files to re-run DUSt3R)")
-            # Return a mock scene object - won't be used since outputs exist
             return None
 
         # ─── PART A: PAIRWISE INFERENCE ─────────────────────────────────
         output = self._run_pairwise_inference(frames)
-        # FLUSH VRAM: The pairwise output is huge. Clear the cache before alignment.
+
+        # ─── PART B: AGGRESSIVE VRAM MANAGEMENT ─────────────────────────
+        # The model is huge (~2GB). We don't need it for alignment.
+        # Let's move it to CPU RAM to free up the GPU.
+        print("Freeing model from VRAM to make room for alignment...")
         if self.device == "cuda":
+            self.model = self.model.to("cpu")
             torch.cuda.empty_cache()
 
-        # ─── PART B: GLOBAL ALIGNMENT ───────────────────────────────────
+        # ─── PART C: GLOBAL ALIGNMENT ───────────────────────────────────
         print("Running Global Alignment...")
-        scene = global_aligner(output, device=self.device, optimize_pp=False)
-
-        # Try on MPS first, fallback to CPU on OOM
         try:
+            # Because we freed the model, we now have ~2GB of extra space here!
             scene = global_aligner(output, device=self.device, optimize_pp=False)
             scene.compute_global_alignment(
                 init="mst", niter=300, schedule="linear", lr=0.01
             )
             print(f"✅ Global alignment complete on {self.device}.")
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower() or "mps" in str(e).lower():
-                print(
-                    "⚠️  OOM detected on GPU. Moving scene to CPU for Global Alignment..."
-                )
-                print("   (This will be slower but won't crash)")
-
-                # Flush the failed GPU memory
+            
+        except Exception as e:
+            # Fallback if it somehow still OOMs
+            if "out of memory" in str(e).lower() or "allocate" in str(e).lower():
+                print("⚠️  OOM detected on GPU. Moving scene to CPU for Global Alignment...")
                 if self.device == "cuda":
                     torch.cuda.empty_cache()
 
-                # Re-initialize the aligner forcefully on the CPU
-                scene = scene.to("cpu", optimize_pp=False)
+                scene = global_aligner(output, device="cpu", optimize_pp=False)
                 scene.compute_global_alignment(
                     init="mst", niter=300, schedule="linear", lr=0.01
                 )
                 print("✅ Global alignment complete on CPU (OOM fallback).")
             else:
-                raise  # Re-raise if it's a different error
+                raise e
+        finally:
+            # Put the model back on the GPU for the next video
+            if self.device == "cuda":
+                self.model = self.model.to(self.device)
 
         return scene
 

@@ -304,8 +304,9 @@ class SemanticEngine:
         # 1. Prepare Frames
         frames_dir = self.extract_frames(video_path)
 
-        # 2. Initialize Video State
-        inference_state = self.video_predictor.init_state(video_path=frames_dir)
+        # 2. Initialize Video State (FIXED: Wrapped in autocast)
+        with self._autocast_ctx():
+            inference_state = self.video_predictor.init_state(video_path=frames_dir)
 
         # 3. Auto-Prompt Frame 0
         print("Generating automatic masks for Frame 0...")
@@ -316,7 +317,7 @@ class SemanticEngine:
         image0 = cv2.imread(frame0_path)
         image0 = cv2.cvtColor(image0, cv2.COLOR_BGR2RGB)
 
-        # --- Mask generation wrapped in autocast for CUDA, no-op elsewhere ---
+        # --- Mask generation wrapped in autocast ---
         with self._autocast_ctx():
             masks0 = self.mask_generator.generate(image0)
         print(f"Found {len(masks0)} objects in Frame 0.")
@@ -328,22 +329,23 @@ class SemanticEngine:
 
         output_masks = {}
 
-        # 4. Add Prompts to Video Predictor
+        # 4. Add Prompts to Video Predictor (FIXED: Wrapped in autocast)
         final_out_obj_ids = []
         final_out_mask_logits = []
 
-        for i, mask_data in enumerate(masks0):
-            mask = mask_data["segmentation"].astype(np.bool_)
-            obj_id = i + 1
+        with self._autocast_ctx():
+            for i, mask_data in enumerate(masks0):
+                mask = mask_data["segmentation"].astype(np.bool_)
+                obj_id = i + 1
 
-            _, final_out_obj_ids, final_out_mask_logits = (
-                self.video_predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    mask=mask,
+                _, final_out_obj_ids, final_out_mask_logits = (
+                    self.video_predictor.add_new_mask(
+                        inference_state=inference_state,
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        mask=mask,
+                    )
                 )
-            )
 
         # Save Frame 0 results
         if len(masks0) > 0:
@@ -365,8 +367,7 @@ class SemanticEngine:
                     for i, obj_id in enumerate(out_obj_ids)
                 }
 
-        # Flush VRAM after a full video pass to prevent memory leaks on CUDA.
-        # Silently skipped on MPS and CPU where it is not applicable.
+        # Flush VRAM after a full video pass
         if self.device == "cuda":
             torch.cuda.empty_cache()
 

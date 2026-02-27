@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { listPlyFiles } from "../api";
+import { uploadVideo, processVideo, pollStatus, listPlyFiles, BASE_URL } from "../api";
 
 /* ─────────────────────────────────────────────────────────────
    CSS — matches Mirra HeroPage design system exactly
@@ -552,6 +552,134 @@ const css = `
   from { transform: rotate(0deg); }
   to   { transform: rotate(360deg); }
 }
+
+/* ═══════════════════════════════════════
+   PROCESSING OVERLAY
+═══════════════════════════════════════ */
+.proc-overlay {
+  position: fixed; inset: 0; z-index: 9999;
+  background: rgba(249,248,246,0.96);
+  backdrop-filter: blur(16px);
+  display: flex; align-items: center; justify-content: center;
+  animation: upIn 0.35s var(--ease-out) both;
+}
+.proc-card {
+  background: white;
+  border: 1px solid var(--s-200);
+  border-radius: 24px;
+  padding: 52px 56px 48px;
+  width: 480px; max-width: 92vw;
+  box-shadow: var(--sh-md);
+}
+.proc-icon {
+  width: 56px; height: 56px; border-radius: 16px;
+  background: var(--s-50); border: 1px solid var(--s-200);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1.5rem; margin-bottom: 28px;
+  position: relative;
+}
+.proc-spinner {
+  position: absolute; inset: -6px;
+  border: 1.5px solid transparent;
+  border-top-color: var(--sky);
+  border-right-color: rgba(14,165,233,0.3);
+  border-radius: 50%;
+  animation: spinSlow 0.9s linear infinite;
+}
+.proc-title {
+  font-family: 'DM Serif Display', serif;
+  font-size: 1.6rem; font-weight: 400; letter-spacing: -0.02em;
+  color: var(--ink); margin-bottom: 6px;
+}
+.proc-sub {
+  font-family: 'DM Mono', monospace; font-size: 0.65rem;
+  color: var(--s-400); letter-spacing: 0.08em; margin-bottom: 36px;
+}
+.proc-stages { display: flex; flex-direction: column; gap: 10px; margin-bottom: 36px; }
+.proc-stage {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 16px; border-radius: 12px;
+  border: 1px solid var(--s-100);
+  background: var(--s-50);
+  transition: all 0.3s var(--ease-out);
+}
+.proc-stage.active {
+  border-color: rgba(14,165,233,0.25);
+  background: rgba(14,165,233,0.04);
+}
+.proc-stage.done {
+  border-color: rgba(34,197,94,0.2);
+  background: rgba(34,197,94,0.04);
+}
+.stage-dot {
+  width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.75rem;
+  background: var(--s-100); border: 1px solid var(--s-200);
+  transition: all 0.25s;
+}
+.proc-stage.active .stage-dot {
+  background: rgba(14,165,233,0.1); border-color: rgba(14,165,233,0.3);
+  animation: fcPulse 1s ease infinite;
+}
+.proc-stage.done .stage-dot {
+  background: rgba(34,197,94,0.1); border-color: rgba(34,197,94,0.3);
+}
+.stage-info { flex: 1; }
+.stage-name {
+  font-size: 0.82rem; font-weight: 600; color: var(--ink); margin-bottom: 2px;
+  transition: color 0.25s;
+}
+.proc-stage.active .stage-name { color: var(--sky); }
+.proc-stage.done  .stage-name { color: var(--green); }
+.stage-model {
+  font-family: 'DM Mono', monospace; font-size: 0.58rem; color: var(--s-400);
+}
+.stage-badge {
+  font-family: 'DM Mono', monospace; font-size: 0.55rem; letter-spacing: 0.06em;
+  padding: 3px 9px; border-radius: 100px;
+  border: 1px solid var(--s-200); color: var(--s-400); background: white;
+  transition: all 0.25s;
+}
+.proc-stage.active .stage-badge { border-color: rgba(14,165,233,0.25); color: var(--sky); background: rgba(14,165,233,0.05); }
+.proc-stage.done  .stage-badge { border-color: rgba(34,197,94,0.25); color: var(--green); background: rgba(34,197,94,0.05); }
+
+/* Progress bar */
+.proc-progress { margin-bottom: 20px; }
+.proc-bar-track { height: 3px; border-radius: 2px; background: var(--s-100); overflow: hidden; }
+.proc-bar-fill {
+  height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg, var(--sky), var(--violet));
+  transition: width 0.6s var(--ease-out);
+}
+.proc-bar-lbl {
+  display: flex; justify-content: space-between;
+  font-family: 'DM Mono', monospace; font-size: 0.58rem;
+  color: var(--s-400); margin-top: 8px;
+}
+
+/* Error state */
+.proc-error {
+  padding: 14px 16px; border-radius: 12px;
+  border: 1px solid rgba(239,68,68,0.2);
+  background: rgba(239,68,68,0.04);
+  margin-bottom: 28px;
+}
+.proc-error-title {
+  font-size: 0.8rem; font-weight: 600; color: #ef4444; margin-bottom: 4px;
+}
+.proc-error-msg {
+  font-family: 'DM Mono', monospace; font-size: 0.62rem; color: var(--s-500);
+  line-height: 1.55;
+}
+.btn-retry {
+  width: 100%; padding: 14px; border: 1px solid var(--s-200);
+  border-radius: 12px; font-family: 'DM Sans', sans-serif;
+  font-size: 0.85rem; font-weight: 600; color: var(--ink);
+  background: white; cursor: pointer;
+  transition: all 0.22s var(--ease-out);
+}
+.btn-retry:hover { background: var(--s-50); transform: translateY(-1px); box-shadow: var(--sh-xs); }
 `;
 
 /* ─── Helpers ──────────────────────────────────── */
@@ -588,42 +716,158 @@ const SPECS = [
   { v: "ROCm", l: "Backend" },
 ];
 
+/* ─── Processing overlay stages definition ── */
+const PROC_STAGES = [
+  { id: "upload", label: "Uploading Video", model: "FastAPI", glyph: "⬆", apiTrigger: "upload" },
+  { id: "frames", label: "Extracting Frames", model: "OpenCV", glyph: "◈", apiTrigger: "pending" },
+  { id: "geometry", label: "Depth Estimation", model: "DUSt3R ViT-L", glyph: "▒", apiTrigger: "processing" },
+  { id: "semantic", label: "Semantic Fusion", model: "SAM 2 + Mirra", glyph: "▓", apiTrigger: "processing" },
+  { id: "finalise", label: "Finalising Scene", model: "FusionEngine", glyph: "█", apiTrigger: "processing" },
+];
+
+/* Maps backend status → active stage index */
+function stageFromStatus(uploadDone, apiStatus) {
+  if (!uploadDone) return 0;
+  if (apiStatus === "PENDING") return 1;
+  if (apiStatus === "PROCESSING") return 3; // show mid-processing
+  return 4;
+}
+
 /* ─── Main component ──────────────────────────── */
 export default function UploadPage({ setPage, onComplete }) {
   const fileInputRef = useRef(null);
+  const pollRef = useRef(null);
+
   const [file, setFile] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  /* load existing scenes */
-  useEffect(() => {
-    (async () => {
-      try {
-        const d = await listPlyFiles();
-        setFiles(d.files || []);
-      } catch (_) {
-        setFiles([]);
-      } finally {
-        setLoading(false);
-      }
-    })();
+  /* Pipeline state machine */
+  const [phase, setPhase] = useState("IDLE"); // IDLE | UPLOADING | PROCESSING | DONE | ERROR
+  const [stageIdx, setStageIdx] = useState(0);       // 0-4 active stage
+  const [jobId, setJobId] = useState(null);
+  const [jobResult, setJobResult] = useState(null);
+  const [errMsg, setErrMsg] = useState(null);
+
+  /* ── Load existing scenes ─────────────────────── */
+  const refreshFiles = useCallback(async () => {
+    try {
+      const d = await listPlyFiles();
+      setFiles(d.files || []);
+    } catch (_) {
+      setFiles([]);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
+  useEffect(() => { refreshFiles(); }, [refreshFiles]);
+
+  /* ── Drag / file pick ────────────────────────── */
   const pickFile = useCallback((f) => { if (f) setFile(f); }, []);
   const clearFile = useCallback((e) => { e.stopPropagation(); setFile(null); }, []);
-
   const onDrop = useCallback((e) => {
     e.preventDefault(); setDragOver(false);
     pickFile(e.dataTransfer.files[0]);
   }, [pickFile]);
 
+  /* ── Open existing scene ─────────────────────── */
   const openScene = useCallback((f) => {
     if (onComplete) onComplete(f);
     if (setPage) setPage("viewer");
   }, [onComplete, setPage]);
 
+  /* ── Stop polling ────────────────────────────── */
+  const stopPoll = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }, []);
+
+  useEffect(() => stopPoll, [stopPoll]); // cleanup on unmount
+
+  /* ── Poll job status ─────────────────────────── */
+  const startPolling = useCallback((id) => {
+    stopPoll();
+    pollRef.current = setInterval(async () => {
+      try {
+        const data = await pollStatus(id);
+        const s = data.status;
+
+        if (s === "PENDING") {
+          setStageIdx(1);
+        } else if (s === "PROCESSING") {
+          // Animate through stages 2-4 smoothly
+          setStageIdx((prev) => Math.min(prev + 1, 4));
+        } else if (s === "COMPLETED") {
+          stopPoll();
+          setStageIdx(4);
+          setJobResult(data);
+          setPhase("DONE");
+          await refreshFiles();
+          // Small delay so user sees "Done" briefly
+          setTimeout(() => {
+            if (onComplete) onComplete(data);
+            if (setPage) setPage("viewer");
+          }, 900);
+        } else if (s === "FAILED") {
+          stopPoll();
+          setErrMsg(data.error || "Pipeline failed. Check backend logs.");
+          setPhase("ERROR");
+        }
+      } catch (e) {
+        stopPoll();
+        setErrMsg(e.message || "Network error while polling status.");
+        setPhase("ERROR");
+      }
+    }, 2000);
+  }, [stopPoll, refreshFiles, onComplete, setPage]);
+
+  /* ── Main launch handler ─────────────────────── */
+  const handleLaunch = useCallback(async () => {
+    if (!file) return;
+    setPhase("UPLOADING");
+    setStageIdx(0);
+    setErrMsg(null);
+    setJobResult(null);
+
+    try {
+      /* 1. Upload */
+      const uploadData = await uploadVideo(file);
+      setStageIdx(1);
+      setPhase("PROCESSING");
+
+      /* 2. Start pipeline */
+      const procData = await processVideo(uploadData.filename);
+      const id = procData.job_id;
+      setJobId(id);
+      setStageIdx(1);
+
+      /* 3. Poll status */
+      startPolling(id);
+
+    } catch (e) {
+      stopPoll();
+      setErrMsg(e.message || "An unexpected error occurred.");
+      setPhase("ERROR");
+    }
+  }, [file, startPolling, stopPoll]);
+
+  /* ── Retry (reset to IDLE) ───────────────────── */
+  const handleRetry = useCallback(() => {
+    setPhase("IDLE");
+    setStageIdx(0);
+    setJobId(null);
+    setJobResult(null);
+    setErrMsg(null);
+    setFile(null);
+    stopPoll();
+  }, [stopPoll]);
+
+  /* ── Progress % ──────────────────────────────── */
+  const progress = Math.round((stageIdx / (PROC_STAGES.length - 1)) * 100);
+
   const dzClass = ["dz-card", dragOver ? "drag-over" : "", file ? "has-file" : ""].filter(Boolean).join(" ");
+  const isRunning = phase === "UPLOADING" || phase === "PROCESSING" || phase === "DONE";
 
   return (
     <div className="up-page">
@@ -633,6 +877,84 @@ export default function UploadPage({ setPage, onComplete }) {
       <div className="up-bg-grid" />
       <div className="up-glow" />
       <div className="up-glow-r" />
+
+      {/* ════════════════════════════════
+          PROCESSING OVERLAY
+      ════════════════════════════════ */}
+      {isRunning && (
+        <div className="proc-overlay">
+          <div className="proc-card">
+            {/* Icon + spinner */}
+            <div className="proc-icon">
+              {phase === "DONE" ? "✓" : "⬡"}
+              {phase !== "DONE" && <div className="proc-spinner" />}
+            </div>
+
+            <div className="proc-title">
+              {phase === "DONE" ? "Scene Ready" : "Processing…"}
+            </div>
+            <div className="proc-sub">
+              {phase === "DONE"
+                ? "REDIRECTING TO VIEWER"
+                : phase === "UPLOADING"
+                  ? "UPLOADING · PLEASE WAIT"
+                  : `JOB · ${jobId?.slice(0, 8).toUpperCase() ?? "…"}`}
+            </div>
+
+            {/* Stage rows */}
+            <div className="proc-stages">
+              {PROC_STAGES.map((s, i) => {
+                const isDone = i < stageIdx;
+                const isActive = i === stageIdx;
+                return (
+                  <div
+                    key={s.id}
+                    className={`proc-stage ${isDone ? "done" : ""} ${isActive ? "active" : ""}`}
+                  >
+                    <div className="stage-dot">
+                      {isDone ? "✓" : isActive ? s.glyph : s.glyph}
+                    </div>
+                    <div className="stage-info">
+                      <div className="stage-name">{s.label}</div>
+                      <div className="stage-model">{s.model}</div>
+                    </div>
+                    <div className="stage-badge">
+                      {isDone ? "done" : isActive ? "running" : "queued"}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Progress bar */}
+            <div className="proc-progress">
+              <div className="proc-bar-track">
+                <div className="proc-bar-fill" style={{ width: `${progress}%` }} />
+              </div>
+              <div className="proc-bar-lbl">
+                <span>{PROC_STAGES[stageIdx]?.label}</span>
+                <span>{progress}%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ERROR OVERLAY */}
+      {phase === "ERROR" && (
+        <div className="proc-overlay">
+          <div className="proc-card">
+            <div className="proc-icon" style={{ fontSize: "1.3rem" }}>✗</div>
+            <div className="proc-title">Pipeline Failed</div>
+            <div className="proc-sub">SOMETHING WENT WRONG</div>
+            <div className="proc-error">
+              <div className="proc-error-title">Error</div>
+              <div className="proc-error-msg">{errMsg}</div>
+            </div>
+            <button className="btn-retry" onClick={handleRetry}>↩ Try Again</button>
+          </div>
+        </div>
+      )}
 
       <div className="up-inner">
 
@@ -649,7 +971,7 @@ export default function UploadPage({ setPage, onComplete }) {
           <p className="up-sub">
             Mirra extracts geometry via DUSt3R, segments objects with SAM&nbsp;2,
             and fuses everything into a labeled semantic 3D world — automatically,
-            in under 5&nbsp;seconds.
+            in under 5&nbsp;minutes.
           </p>
         </div>
 
@@ -751,7 +1073,7 @@ export default function UploadPage({ setPage, onComplete }) {
 
             {/* ── Launch button (only when file selected) ── */}
             {file && (
-              <button className="btn-launch">
+              <button className="btn-launch" onClick={handleLaunch}>
                 <div className="btn-launch-left">
                   <span className="btn-launch-label">Run Mirra Pipeline</span>
                   <span className="btn-launch-sub">DUSt3R → SAM 2 → Fusion</span>
@@ -821,7 +1143,7 @@ export default function UploadPage({ setPage, onComplete }) {
                     const color = sceneColor(f.filename);
                     const glyph = sceneGlyph(f.filename);
                     const name = stripExt(f.filename);
-                    const size = fmtBytes(f.size);
+                    const size = fmtBytes(f.size_bytes ?? f.size);
                     return (
                       <div
                         key={f.filename}
@@ -857,9 +1179,9 @@ export default function UploadPage({ setPage, onComplete }) {
               {/* footer */}
               <div className="sp-footer">
                 <span className="sp-footer-info">
-                  Pipeline active · ROCm backend
+                  Pipeline active · MPS backend
                 </span>
-                <span className="sp-footer-badge">AMD</span>
+                <span className="sp-footer-badge">Mirra</span>
               </div>
 
             </div>

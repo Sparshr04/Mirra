@@ -241,7 +241,9 @@ def _run_pipeline(job_id: str, video_filename: str) -> None:
         JOBS[job_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
         logger.info("[%s] Pipeline COMPLETED successfully.", job_id)
 
-    except Exception as exc:  # noqa: BLE001
+    except BaseException as exc:  # noqa: BLE001
+        # BaseException catches SystemExit (from sys.exit), KeyboardInterrupt,
+        # and all standard Exceptions — nothing can silently kill the worker.
         err_detail = traceback.format_exc()
         logger.error("[%s] Pipeline FAILED:\n%s", job_id, err_detail)
         JOBS[job_id]["status"] = "FAILED"

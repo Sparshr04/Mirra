@@ -382,7 +382,12 @@ class GeometryEngine:
         return output
 
     def _save_camera_poses(self, scene, frames_dir):
-        """Extract and save camera poses from DUSt3R scene."""
+        """Extract and save camera poses from DUSt3R scene.
+
+        Saves c2w, focals, principal_points, image_names, and image_shapes
+        into a single .npz archive. The principal_points are critical for
+        accurate 3D→2D reprojection in the FusionEngine.
+        """
         geo_dir = os.path.abspath(
             os.path.join(self.project_root, "outputs", "geometry")
         )
@@ -397,6 +402,11 @@ class GeometryEngine:
         if focals.ndim == 2:
             focals = focals.mean(axis=1)
 
+        # Extract principal points (cx, cy) from scene intrinsics
+        # These are the optimized optical centers, NOT always (W/2, H/2)
+        pp = _to_numpy(scene.get_principal_points())  # (N, 2) as (cx, cy)
+        print(f"   Principal points (first cam): cx={pp[0, 0]:.1f}, cy={pp[0, 1]:.1f}")
+
         # Get image names and shapes
         image_names = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
 
@@ -409,11 +419,12 @@ class GeometryEngine:
             image_shapes.append([h, w])
         image_shapes = np.array(image_shapes)
 
-        # Save to npz
+        # Save to npz (including principal_points for fusion engine)
         np.savez_compressed(
             poses_path,
             c2w=c2w,
             focals=focals,
+            principal_points=pp,
             image_names=np.array(image_names),
             image_shapes=image_shapes,
         )

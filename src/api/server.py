@@ -263,14 +263,14 @@ async def health_check() -> HealthResponse:
     """
     return HealthResponse()
 
-    # Upload Video
-    ("/api/v1/upload",)
-    response_model = (UploadResponse,)
-    status_code = (status.HTTP_201_CREATED,)
-    summary = ("Upload a video file",)
-    tags = (["Pipeline"],)
 
-
+@app.post(
+    "/api/v1/upload",
+    response_model=UploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload a video file",
+    tags=["Pipeline"],
+)
 async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
     """
     Accepts a multipart video upload.
@@ -325,14 +325,14 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
         size_bytes=file_size,
     )
 
-    # Trigger Pipeline
-    ("/api/v1/process",)
-    response_model = (ProcessResponse,)
-    status_code = (status.HTTP_202_ACCEPTED,)
-    summary = ("Enqueue the ML pipeline for a video",)
-    tags = (["Pipeline"],)
 
-
+@app.post(
+    "/api/v1/process",
+    response_model=ProcessResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Enqueue the ML pipeline for a video",
+    tags=["Pipeline"],
+)
 async def process_video(
     body: ProcessRequest,
     background_tasks: BackgroundTasks,
@@ -371,13 +371,13 @@ async def process_video(
     logger.info("Job %s enqueued for '%s'.", job_id, body.filename)
     return ProcessResponse(job_id=job_id)
 
-    # ── 4. Job Status
-    ("/api/v1/status/{job_id}",)
-    response_model = (JobStatusResponse,)
-    summary = ("Poll the status of an enqueued job",)
-    tags = (["Pipeline"],)
 
-
+@app.get(
+    "/api/v1/status/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Poll the status of an enqueued job",
+    tags=["Pipeline"],
+)
 async def get_job_status(job_id: str) -> JobStatusResponse:
     """
     Returns the current state of a pipeline job.
@@ -424,6 +424,33 @@ async def get_job_status(job_id: str) -> JobStatusResponse:
         ply_url=ply_url,
         label_map_url=label_map_url,
     )
+
+
+# ── 5. List Output Files ──────────────────────────────────────────────────────
+@app.get(
+    "/api/v1/files",
+    summary="List output PLY files",
+    tags=["Pipeline"],
+)
+async def list_output_files():
+    """
+    Lists all .ply and .json files in ``outputs/final/``.
+    The frontend uses this to populate the 'Existing Scenes' panel.
+    """
+    files = []
+    if FINAL_DIR.is_dir():
+        for p in sorted(FINAL_DIR.iterdir()):
+            if p.suffix in {".ply", ".json"} and p.is_file():
+                stat = p.stat()
+                files.append({
+                    "filename": p.name,
+                    "url": f"/files/outputs/{p.name}",
+                    "size_bytes": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                })
+    return {"files": files, "count": len(files)}
 
 
 if __name__ == "__main__":

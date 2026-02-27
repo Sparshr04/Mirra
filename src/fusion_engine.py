@@ -4,12 +4,32 @@ import numpy as np
 import open3d as o3d
 import hydra
 from omegaconf import DictConfig
-from collections import Counter
 from tqdm import tqdm
 import struct
 
 
 class FusionEngine:
+    """Fuses 3D geometry with 2D semantic masks via multi-view projection voting.
+
+    Coordinate Convention (OpenCV, matching DUSt3R):
+        - X: right
+        - Y: down
+        - Z: forward (into the scene)
+        - Depth is positive for points in front of the camera.
+
+    Projection Model (Pinhole):
+        u = f * X_cam / Z_cam + cx
+        v = f * Y_cam / Z_cam + cy
+
+    where (cx, cy) are the principal point from DUSt3R's intrinsics,
+    NOT assumed to be (W/2, H/2).
+    """
+
+    # Minimum depth threshold (meters in scene units).
+    # Points closer than this to the camera are rejected to avoid
+    # unstable projections from near-zero Z division.
+    MIN_DEPTH = 0.01
+
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
         print("FusionEngine initialized.")
@@ -41,7 +61,15 @@ class FusionEngine:
         return original_points, original_colors
 
     def load_poses(self):
-        """Load camera poses from geometry engine output."""
+        """Load camera poses and intrinsics from geometry engine output.
+
+        Returns:
+            c2w: (N, 4, 4) camera-to-world matrices
+            focals: (N,) focal lengths in pixels
+            principal_points: (N, 2) as (cx, cy) in pixels
+            image_names: (N,) filenames
+            image_shapes: (N, 2) as (H, W)
+        """
         poses_path = os.path.join(self.project_root, "outputs", "geometry", "poses.npz")
         if not os.path.exists(poses_path):
             raise FileNotFoundError(f"Camera poses not found: {poses_path}")
@@ -52,8 +80,20 @@ class FusionEngine:
         focals = data["focals"]  # (N,)
         image_names = data["image_names"]  # (N,)
         image_shapes = data["image_shapes"]  # (N, 2)
+
+        # Load principal points with backward-compatible fallback
+        if "principal_points" in data:
+            principal_points = data["principal_points"]  # (N, 2)
+            print(f"  Using DUSt3R principal points from poses.npz")
+        else:
+            # Legacy poses.npz without principal points: fall back to image center
+            print("  ⚠️  No principal_points in poses.npz — falling back to (W/2, H/2)")
+            principal_points = np.stack(
+                [image_shapes[:, 1] / 2.0, image_shapes[:, 0] / 2.0], axis=1
+            )
+
         print(f"Loaded {len(image_names)} camera poses.")
-        return c2w, focals, image_names, image_shapes
+        return c2w, focals, principal_points, image_names, image_shapes
 
     def load_masks(self):
         """Load semantic masks from semantics engine output."""
@@ -84,110 +124,180 @@ class FusionEngine:
         print(f"Loaded masks for {len(all_masks)} frames.")
         return all_masks
 
-    def project_points(self, points, c2w_inv, focal, H, W):
-        """
-        Project 3D world-space points to 2D image plane.
+    def project_points(self, points, w2c, focal, cx, cy, H, W):
+        """Project 3D world-space points to 2D image plane (vectorized).
 
-        CRITICAL: This function does NOT modify the input points array.
-        It only returns 2D pixel coordinates.
+        Uses the standard pinhole camera model with OpenCV conventions:
+            u = f · X_cam / Z_cam + cx
+            v = f · Y_cam / Z_cam + cy
 
         Args:
-            points: (N, 3) WORLD SPACE coordinates (UNMODIFIED)
-            c2w_inv: (4, 4) world-to-camera transform
+            points: (P, 3) world-space XYZ coordinates (NOT modified)
+            w2c: (4, 4) world-to-camera transform (inverse of c2w)
             focal: scalar focal length in pixels
-            H, W: image dimensions
+            cx, cy: principal point in pixels (from DUSt3R intrinsics)
+            H, W: image dimensions in pixels
 
         Returns:
-            u, v: (N,) pixel coordinates in image space
-            valid: (N,) boolean mask of valid projections
+            u: (P,) integer pixel x-coordinates (column index)
+            v: (P,) integer pixel y-coordinates (row index)
+            valid: (P,) boolean mask — True for points that project
+                   within the image bounds and are in front of the camera
         """
-        # Convert to homogeneous coordinates (creates new array, doesn't modify input)
-        points_h = np.hstack([points, np.ones((points.shape[0], 1))])  # (N, 4)
+        P = points.shape[0]
 
-        # World → Camera (transform happens on new array)
-        points_cam = (c2w_inv @ points_h.T).T  # (N, 4)
+        # ── Step 1: World → Camera ────────────────────────────────────
+        # Convert to homogeneous coordinates (creates NEW array)
+        ones = np.ones((P, 1), dtype=points.dtype)
+        points_h = np.hstack([points, ones])  # (P, 4)
 
-        # Extract camera coordinates
+        # Apply w2c transform: R @ X_world + t → X_cam
+        points_cam = (w2c @ points_h.T).T[:, :3]  # (P, 3)
+
         x_cam = points_cam[:, 0]
         y_cam = points_cam[:, 1]
         z_cam = points_cam[:, 2]
 
-        # Check depth validity
-        valid_depth = z_cam > 0
+        # ── Step 2: Depth validity ────────────────────────────────────
+        # Reject points behind the camera (Z ≤ 0) AND points too close
+        # to the camera (Z < MIN_DEPTH) where projection is unstable.
+        valid_depth = z_cam > self.MIN_DEPTH
 
-        # Camera → Image (pinhole projection to 2D)
-        u = (focal * x_cam / (z_cam + 1e-8)) + W / 2
-        v = (focal * y_cam / (z_cam + 1e-8)) + H / 2
+        # ── Step 3: Camera → Pixel (pinhole projection) ──────────────
+        # Only compute projection for valid-depth points to avoid NaN
+        # Use safe division: divide only where z_cam > MIN_DEPTH
+        inv_z = np.where(valid_depth, 1.0 / z_cam, 0.0)
 
-        # Check bounds
+        u_float = focal * x_cam * inv_z + cx
+        v_float = focal * y_cam * inv_z + cy
+
+        # ── Step 4: Bounds check ──────────────────────────────────────
+        # Round to nearest pixel (NOT truncate — avoids systematic ±1px error)
+        u = np.round(u_float).astype(np.int64)
+        v = np.round(v_float).astype(np.int64)
+
         valid_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H)
         valid = valid_depth & valid_bounds
 
-        # Return ONLY 2D coordinates, NOT modified 3D points
-        return u.astype(int), v.astype(int), valid
+        return u, v, valid
 
-    def vote_semantics(self, points, c2w, focals, image_shapes, masks):
-        """
-        Vote on semantic labels for each 3D point across all views.
+    def vote_semantics(
+        self, points, c2w, focals, principal_points, image_shapes, masks
+    ):
+        """Vote on semantic labels for each 3D point across all views.
 
-        CRITICAL: Input 'points' array is NEVER modified.
+        For each camera view, projects ALL points to 2D, then samples
+        the semantic masks at the projected coordinates. Each hit increments
+        a vote counter. The final label is the majority vote across views.
+
+        This implementation is fully vectorized — no per-point Python loops.
+
+        Args:
+            points: (P, 3) world-space coordinates (NEVER modified)
+            c2w: (N, 4, 4) camera-to-world transforms
+            focals: (N,) focal lengths
+            principal_points: (N, 2) as (cx, cy)
+            image_shapes: (N, 2) as (H, W)
+            masks: dict of {frame_idx: {obj_id: (H, W) bool mask}}
 
         Returns:
-            labels: (N,) array of label IDs (0 = unlabeled)
+            labels: (P,) array of label IDs (0 = unlabeled)
         """
-        N = points.shape[0]
+        P = points.shape[0]
         num_views = len(c2w)
 
-        # Initialize vote matrix: [point_idx] → {label_id: count}
-        votes = [Counter() for _ in range(N)]
+        # Collect all unique object IDs across all frames
+        all_obj_ids = set()
+        for frame_masks in masks.values():
+            all_obj_ids.update(frame_masks.keys())
 
-        print(f"Projecting {N} points across {num_views} views...")
+        if not all_obj_ids:
+            print("⚠️  No masks found. Returning all-unlabeled.")
+            return np.zeros(P, dtype=np.int32)
+
+        # Map obj_id → column index in vote matrix (0-indexed)
+        obj_id_list = sorted(all_obj_ids)
+        obj_id_to_col = {obj_id: col for col, obj_id in enumerate(obj_id_list)}
+        num_labels = len(obj_id_list)
+
+        # Vote matrix: (P, num_labels) counts how many views labeled each point
+        votes = np.zeros((P, num_labels), dtype=np.int32)
+
+        print(
+            f"Projecting {P} points across {num_views} views ({num_labels} object classes)..."
+        )
         for view_idx in tqdm(range(num_views), desc="View projection"):
             if view_idx not in masks:
                 continue  # No masks for this frame
 
             c2w_mat = c2w[view_idx]
             w2c = np.linalg.inv(c2w_mat)
-            focal = focals[view_idx]
-            H, W = image_shapes[view_idx]
+            focal = float(focals[view_idx])
+            cx, cy = (
+                float(principal_points[view_idx, 0]),
+                float(principal_points[view_idx, 1]),
+            )
+            H, W = int(image_shapes[view_idx, 0]), int(image_shapes[view_idx, 1])
 
-            # Project all points to this view (points array NOT modified)
-            u, v, valid = self.project_points(points, w2c, focal, H, W)
+            # Project all points to this view
+            u, v, valid = self.project_points(points, w2c, focal, cx, cy, H, W)
 
-            # Sample masks at projected coordinates
+            if not np.any(valid):
+                continue
+
+            # Extract valid-only indices for vectorized mask sampling
+            valid_indices = np.where(valid)[0]
+            u_valid = u[valid_indices]
+            v_valid = v[valid_indices]
+
+            # Sample each mask at the projected coordinates (vectorized)
             frame_masks = masks[view_idx]
-            for point_idx in np.where(valid)[0]:
-                ui, vi = u[point_idx], v[point_idx]
+            for obj_id, mask in frame_masks.items():
+                col = obj_id_to_col[obj_id]
 
-                # Check which mask(s) this pixel belongs to
-                for obj_id, mask in frame_masks.items():
-                    if mask[vi, ui]:  # Note: mask is (H, W), so index by (v, u)
-                        votes[point_idx][obj_id] += 1
+                # Vectorized: sample mask at all valid projected pixels at once
+                # mask shape is (H, W), index by (row=v, col=u)
+                hits = mask[v_valid, u_valid]  # (num_valid,) bool array
 
-        # Aggregate votes
-        labels = np.zeros(N, dtype=np.int32)
-        for i, vote_dict in enumerate(votes):
-            if vote_dict:
-                # Most common label
-                labels[i] = vote_dict.most_common(1)[0][0]
+                # Increment votes for points that hit this mask
+                votes[valid_indices[hits], col] += 1
+
+        # ── Aggregate: majority vote ─────────────────────────────────
+        # For each point, pick the label with the most votes (if any)
+        labels = np.zeros(P, dtype=np.int32)
+        has_votes = votes.sum(axis=1) > 0
+        if np.any(has_votes):
+            best_cols = votes[has_votes].argmax(axis=1)
+            labels[has_votes] = np.array(obj_id_list)[best_cols]
 
         labeled_count = np.sum(labels > 0)
-        print(f"Labeled {labeled_count}/{N} points ({100 * labeled_count / N:.1f}%)")
+        print(f"Labeled {labeled_count}/{P} points ({100 * labeled_count / P:.1f}%)")
         return labels
 
     def save_semantic_ply(self, original_points, original_colors, labels, output_path):
-        """
-        Save point cloud with custom 'label_id' scalar field.
-        Uses binary PLY format for efficiency.
+        """Save point cloud with custom 'label_id' scalar field.
+
+        Uses binary PLY format (little-endian) for efficiency.
         Includes NaN/Inf filtering and bounds checking.
 
-        CRITICAL: Saves the ORIGINAL world-space points, NOT transformed points.
+        CRITICAL INVARIANTS:
+          1. Saves the ORIGINAL world-space points — geometry is NEVER modified.
+          2. Uses '<' (little-endian, NO padding) in struct.pack to match
+             the PLY binary_little_endian format exactly.
+
+        BUG HISTORY:
+          struct.pack('fffBBBi', ...) uses NATIVE alignment, which inserts
+          1 padding byte before the 'i' field (to align int to 4 bytes).
+          This produces 20 bytes/vertex instead of the 19 expected by PLY,
+          causing cumulative byte drift that corrupts all coordinates after
+          the first vertex — producing an "exploding starburst" artifact.
+          FIX: Use struct.pack('<fffBBBi', ...) — the '<' prefix forces
+          little-endian byte order with ZERO padding.
         """
         print(f"Saving semantic point cloud to {output_path}...")
 
-        # ─── DEBUG: Verify we're saving original points ──────────────────
-        print(f"\nDEBUG - First 3 ORIGINAL points:")
-        print(original_points[:3])
+        # ─── INTEGRITY CHECK: Snapshot original coordinates ───────────
+        first_3_pts = original_points[:3].copy()
 
         # ─── SANITIZATION: Remove NaN/Inf points ─────────────────────
         valid_mask = np.isfinite(original_points).all(axis=1)
@@ -196,49 +306,70 @@ class FusionEngine:
         if invalid_count > 0:
             print(f"⚠️  Removed {invalid_count} points with NaN/Inf coordinates")
 
-        # Apply filter to ALL arrays
-        points_to_save = original_points[valid_mask]
-        colors_to_save = original_colors[valid_mask]
-        labels_to_save = labels[valid_mask]
+        # Apply filter to ALL arrays (creates copies, original untouched)
+        points_to_save = original_points[valid_mask].copy()
+        colors_to_save = original_colors[valid_mask].copy()
+        labels_to_save = labels[valid_mask].astype(np.int32)
 
         n = len(points_to_save)
         if n == 0:
             print("❌ ERROR: No valid points to save after filtering!")
             return
 
-        # ─── DEBUG: Verify points match after filtering ──────────────────
-        print(f"\nDEBUG - First 3 points TO SAVE (should match original):")
-        print(points_to_save[:3])
+        # ─── INTEGRITY CHECK: Verify points were NOT mutated ─────────
+        assert np.array_equal(original_points[:3], first_3_pts), (
+            "FATAL: original_points were mutated during save!"
+        )
 
-        # ─── TYPE SAFETY ───────────────────────────────────────
-        # Ensure labels are int32
-        labels_to_save = labels_to_save.astype(np.int32)
-
-        # ─── 50/50 COLOR MIX: Semantic where labeled, Original where not ─
+        # ─── SEMANTIC COLORING (vectorized) ───────────────────────────
         final_colors = np.zeros((n, 3), dtype=np.uint8)
+        labeled_mask = labels_to_save > 0
 
-        for i in range(n):
-            if labels_to_save[i] > 0:
-                # Semantic color: assign unique color per label ID
-                label_id = labels_to_save[i]
-                # Simple color mapping: use label_id to generate distinct colors
-                hue = (label_id * 137.5) % 360  # Golden angle for color spread
-                # Convert HSV to RGB (simplified)
-                c = int(hue / 60)
-                x = int(255 * (1 - abs((hue / 60) % 2 - 1)))
-                color_map = [
-                    [255, x, 0],
-                    [x, 255, 0],
-                    [0, 255, x],
-                    [0, x, 255],
-                    [x, 0, 255],
-                    [255, 0, x],
-                ]
-                semantic_rgb = color_map[c % 6]
-                final_colors[i] = semantic_rgb
-            else:
-                # Unlabeled: use ORIGINAL RGB from reconstruction.ply
-                final_colors[i] = (colors_to_save[i] * 255).astype(np.uint8)
+        # Unlabeled points: use original reconstruction colors
+        unlabeled = ~labeled_mask
+        final_colors[unlabeled] = (
+            (colors_to_save[unlabeled] * 255).clip(0, 255).astype(np.uint8)
+        )
+
+        # Labeled points: generate distinct colors via golden-angle hue mapping
+        if np.any(labeled_mask):
+            label_ids = labels_to_save[labeled_mask]
+            hues = (label_ids.astype(np.float64) * 137.5) % 360.0
+            sectors = (hues / 60.0).astype(int) % 6
+            frac = 1.0 - np.abs((hues / 60.0) % 2.0 - 1.0)
+            x_vals = (255.0 * frac).astype(np.uint8)
+
+            semantic_rgb = np.zeros((len(label_ids), 3), dtype=np.uint8)
+            for s in range(6):
+                m = sectors == s
+                if not np.any(m):
+                    continue
+                xv = x_vals[m]
+                if s == 0:
+                    semantic_rgb[m] = np.column_stack(
+                        [np.full_like(xv, 255), xv, np.zeros_like(xv)]
+                    )
+                elif s == 1:
+                    semantic_rgb[m] = np.column_stack(
+                        [xv, np.full_like(xv, 255), np.zeros_like(xv)]
+                    )
+                elif s == 2:
+                    semantic_rgb[m] = np.column_stack(
+                        [np.zeros_like(xv), np.full_like(xv, 255), xv]
+                    )
+                elif s == 3:
+                    semantic_rgb[m] = np.column_stack(
+                        [np.zeros_like(xv), xv, np.full_like(xv, 255)]
+                    )
+                elif s == 4:
+                    semantic_rgb[m] = np.column_stack(
+                        [xv, np.zeros_like(xv), np.full_like(xv, 255)]
+                    )
+                elif s == 5:
+                    semantic_rgb[m] = np.column_stack(
+                        [np.full_like(xv, 255), np.zeros_like(xv), xv]
+                    )
+            final_colors[labeled_mask] = semantic_rgb
 
         # ─── BOUNDS CHECK ────────────────────────────────────────
         x_min, y_min, z_min = points_to_save.min(axis=0)
@@ -251,7 +382,6 @@ class FusionEngine:
             f"Z=[{z_min:.3f}, {z_max:.3f}]"
         )
 
-        # Warn if bounds are suspiciously large
         max_extent = max(x_max - x_min, y_max - y_min, z_max - z_min)
         if max_extent > 1e6:
             print(
@@ -259,35 +389,76 @@ class FusionEngine:
                 "This may cause rendering issues!"
             )
 
-        # ─── PLY EXPORT ─────────────────────────────────────────
-        # PLY header with label_id property
-        header = f"""ply
-format binary_little_endian 1.0
-element vertex {n}
-property float x
-property float y
-property float z
-property uchar red
-property uchar green
-property uchar blue
-property int label_id
-end_header
-"""
+        # ─── PLY EXPORT (vectorized, little-endian, NO PADDING) ──────
+        #
+        # CRITICAL: The '<' prefix in the struct format forces:
+        #   - Little-endian byte order (matching PLY header)
+        #   - ZERO alignment padding (matching PLY vertex size)
+        #
+        # Without '<': struct.pack('fffBBBi') = 20 bytes (1 pad byte)
+        # With    '<': struct.pack('<fffBBBi') = 19 bytes (correct)
+        #
+        VERTEX_FMT = "<fffBBBi"  # 19 bytes exactly
+        assert struct.calcsize(VERTEX_FMT) == 19, (
+            f"PLY vertex size mismatch: {struct.calcsize(VERTEX_FMT)} != 19"
+        )
 
-        # Write binary PLY
+        header = (
+            f"ply\n"
+            f"format binary_little_endian 1.0\n"
+            f"element vertex {n}\n"
+            f"property float x\n"
+            f"property float y\n"
+            f"property float z\n"
+            f"property uchar red\n"
+            f"property uchar green\n"
+            f"property uchar blue\n"
+            f"property int label_id\n"
+            f"end_header\n"
+        )
+
+        # Vectorized binary packing: build the entire buffer in one pass
+        # using a numpy structured array for maximum throughput
+        vertex_dtype = np.dtype(
+            [
+                ("x", "<f4"),
+                ("y", "<f4"),
+                ("z", "<f4"),
+                ("r", "u1"),
+                ("g", "u1"),
+                ("b", "u1"),
+                ("label", "<i4"),
+            ]
+        )
+        assert vertex_dtype.itemsize == 19, (
+            f"Structured dtype size mismatch: {vertex_dtype.itemsize} != 19"
+        )
+
+        vertices = np.zeros(n, dtype=vertex_dtype)
+        vertices["x"] = points_to_save[:, 0].astype(np.float32)
+        vertices["y"] = points_to_save[:, 1].astype(np.float32)
+        vertices["z"] = points_to_save[:, 2].astype(np.float32)
+        vertices["r"] = final_colors[:, 0]
+        vertices["g"] = final_colors[:, 1]
+        vertices["b"] = final_colors[:, 2]
+        vertices["label"] = labels_to_save
+
         with open(output_path, "wb") as f:
             f.write(header.encode("ascii"))
+            f.write(vertices.tobytes())
 
-            for i in range(n):
-                x, y, z = points_to_save[i]
-                r, g, b = final_colors[i]
-                label = labels_to_save[i]
-
-                # Pack: 3 floats + 3 uchars + 1 int
-                f.write(struct.pack("fffBBBi", x, y, z, r, g, b, label))
-
+        # ─── POST-WRITE VERIFICATION ─────────────────────────────────
         file_size = os.path.getsize(output_path)
-        print(f"✅ Semantic PLY saved: {output_path} ({file_size / 1024:.1f} KB)")
+        expected_size = len(header.encode("ascii")) + n * 19
+        if file_size != expected_size:
+            print(
+                f"❌ PLY SIZE MISMATCH: wrote {file_size} bytes, "
+                f"expected {expected_size} (header={len(header.encode('ascii'))}, "
+                f"data={n}×19={n * 19})"
+            )
+        else:
+            print(f"✅ Semantic PLY saved: {output_path} ({file_size / 1024:.1f} KB)")
+            print(f"   Verified: {n} vertices × 19 bytes = correct")
 
     def save_label_map(self, labels, output_path):
         """Save a JSON mapping of label IDs to names (or just list unique IDs)."""
@@ -305,11 +476,13 @@ end_header
         """Execute the full fusion pipeline."""
         # 1. Load data (immutable copies)
         original_points, original_colors = self.load_geometry()
-        c2w, focals, image_names, image_shapes = self.load_poses()
+        c2w, focals, principal_points, image_names, image_shapes = self.load_poses()
         masks = self.load_masks()
 
         # 2. Vote on semantics (original_points NEVER modified)
-        labels = self.vote_semantics(original_points, c2w, focals, image_shapes, masks)
+        labels = self.vote_semantics(
+            original_points, c2w, focals, principal_points, image_shapes, masks
+        )
 
         # 3. Save outputs (using ORIGINAL world-space points)
         final_dir = os.path.join(self.project_root, "outputs", "final")

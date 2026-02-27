@@ -4,8 +4,8 @@
 device: "mps"  # Metal Performance Shaders for Apple Silicon
 
 # Reconstruction Parameters
-resolution: 512 #512
-stride: 100
+resolution: 256 #512
+stride: 45
 
 # Paths
 data:

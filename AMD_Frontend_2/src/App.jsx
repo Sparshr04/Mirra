@@ -169,11 +169,11 @@ nav.main-nav {
 `;
 
 const PAGES = [
-  { id: "hero",     label: "Home" },
+  { id: "hero", label: "Home" },
   { id: "pipeline", label: "Pipeline" },
-  { id: "upload",   label: "Upload" },
-  { id: "viewer",   label: "Viewer" },
-  { id: "why",      label: "Why Us" },
+  { id: "upload", label: "Upload" },
+  { id: "viewer", label: "Viewer" },
+  { id: "why", label: "Why Us" },
   { id: "research", label: "Research" },
 ];
 
@@ -184,7 +184,7 @@ function Nav({ page, setPage }) {
         <div className="nav-logo-mark">
           <svg viewBox="0 0 16 16"><path d="M8 1L15 5V11L8 15L1 11V5L8 1Z" /></svg>
         </div>
-        SimCraft
+        MIRRA
       </div>
       <ul className="nav-links">
         {PAGES.map(p => (
@@ -209,13 +209,13 @@ export default function App() {
 
   const renderPage = () => {
     switch (page) {
-      case "hero":     return <HeroPage setPage={setPage} />;
+      case "hero": return <HeroPage setPage={setPage} />;
       case "pipeline": return <PipelinePage setPage={setPage} />;
-      case "upload":   return <UploadPage setPage={setPage} onComplete={setJobResult} />;
-      case "viewer":   return <ViewerPage setPage={setPage} jobResult={jobResult} />;
-      case "why":      return <WhyPage setPage={setPage} />;
+      case "upload": return <UploadPage setPage={setPage} onComplete={setJobResult} />;
+      case "viewer": return <ViewerPage setPage={setPage} jobResult={jobResult} />;
+      case "why": return <WhyPage setPage={setPage} />;
       case "research": return <ResearchPage setPage={setPage} />;
-      default:         return <HeroPage setPage={setPage} />;
+      default: return <HeroPage setPage={setPage} />;
     }
   };
 

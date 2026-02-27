@@ -42,8 +42,10 @@ def setup_dust3r():
             )
             print("DUSt3R cloned successfully.")
         except subprocess.CalledProcessError as e:
-            print(f"Error cloning DUSt3R: {e}")
-            sys.exit(1)
+            raise RuntimeError(
+                f"Failed to clone DUSt3R repository: {e}. "
+                "Please run 'git submodule update --init --recursive' manually."
+            ) from e
 
     if dust3r_path not in sys.path:
         sys.path.append(dust3r_path)
@@ -69,7 +71,7 @@ except ImportError as e:
     print(
         "Please ensure you are running this from the project root and dependencies are installed."
     )
-    sys.exit(1)
+    raise  # Re-raise so the caller (_run_pipeline) can catch it
 
 # Fix for PyTorch 2.6+ weights_only=True default
 if hasattr(torch.serialization, "add_safe_globals"):
@@ -113,9 +115,10 @@ class GeometryEngine:
                 torch.hub.download_url_to_file(model_url, model_path)
                 print("Download complete.")
             except Exception as e:
-                print(f"Failed to download model: {e}")
-                print("Please download manually and place in checkpoints/ directory.")
-                sys.exit(1)
+                raise RuntimeError(
+                    f"Failed to download DUSt3R model from {model_url}: {e}. "
+                    "Please download manually and place in checkpoints/ directory."
+                ) from e
 
         print(f"Loading model from {model_path}...")
         try:

@@ -1,48 +1,41 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import Spline from "@splinetool/react-spline";
 
-/* ─── Model data ─────────────────────────────── */
+/* ─── Model data & Video Paths ─────────────────── */
 const MODELS = [
   {
-    id: "office", label: "Office Scene", tag: "MODEL 01", accent: "#0ea5e9",
-    palette: {
-      geo: ["#0a0a1a", "#0d1f3c", "#0a3060", "#1a5276", "#2980b9", "#5dade2"],
-      heat: ["#000080", "#0000ff", "#00ffff", "#00ff00", "#ffff00", "#ff6600", "#ff0000"],
-      sem: { bg: "#0c0c14", objects: [{ c: "#e74c3c", x: 18, y: 55, w: 14, h: 24 }, { c: "#2ecc71", x: 38, y: 45, w: 20, h: 35 }, { c: "#3498db", x: 65, y: 48, w: 16, h: 30 }, { c: "#f39c12", x: 80, y: 60, w: 12, h: 18 }] },
-    },
+    id: "classroom", label: "Classroom", tag: "SCENE 01", accent: "#0ea5e9",
+    videos: {
+      rawFlythrough: "/assets/classroom/non_semantic_flythrough .mp4",
+      semFlythrough: "/assets/classroom/semantic_flythrough .mp4",
+      geoRaw: "/assets/classroom/classroom without semantic vedio.mp4",
+      geoSem: "/assets/classroom/classroom with semantic.mp4",
+      original: "/assets/classroom/Classroom camera vedio.mp4", // Newly added
+      heatmap: "/assets/classroom/heatmap_flythrough .mp4",
+    }
   },
   {
-    id: "street", label: "Street Scene", tag: "MODEL 02", accent: "#8b5cf6",
-    palette: {
-      geo: ["#0a0a0a", "#111120", "#182040", "#1e3a5f", "#2e5e8e", "#4a88c0"],
-      heat: ["#000060", "#0000cc", "#0099ff", "#00ffaa", "#aaff00", "#ffaa00", "#ff2200"],
-      sem: { bg: "#0c0c10", objects: [{ c: "#e74c3c", x: 12, y: 40, w: 8, h: 40 }, { c: "#2ecc71", x: 25, y: 50, w: 25, h: 30 }, { c: "#3498db", x: 58, y: 35, w: 10, h: 45 }, { c: "#f39c12", x: 75, y: 52, w: 18, h: 28 }, { c: "#9b59b6", x: 88, y: 45, w: 8, h: 35 }] },
-    },
+    id: "coridoor", label: "Corridor Alpha", tag: "SCENE 02", accent: "#8b5cf6",
+    videos: {
+      rawFlythrough: "/assets/coridoor/non_semantic_flythrough.mp4",
+      semFlythrough: "/assets/coridoor/semantic_flythrough.mp4",
+      geoRaw: "/assets/coridoor/Coridoor without semantic vedio.mov", // Newly added
+      geoSem: "/assets/coridoor/Coridoor with semantic video.mp4",
+      original: "/assets/coridoor/Coridoor camera vedio.mov", // Newly added
+      heatmap: "/assets/coridoor/Coridoor with heatmap.mp4", // Newly added
+    }
   },
   {
-    id: "lab", label: "Lab Environment", tag: "MODEL 03", accent: "#22c55e",
-    palette: {
-      geo: ["#080c0a", "#0c1f12", "#0e3020", "#145c30", "#1e8040", "#2db560"],
-      heat: ["#001a00", "#003300", "#006600", "#00cc00", "#99ff00", "#ffee00", "#ff7700"],
-      sem: { bg: "#080c08", objects: [{ c: "#e74c3c", x: 8, y: 30, w: 12, h: 30 }, { c: "#2ecc71", x: 28, y: 55, w: 22, h: 20 }, { c: "#3498db", x: 52, y: 25, w: 18, h: 45 }, { c: "#f39c12", x: 72, y: 42, w: 15, h: 28 }, { c: "#1abc9c", x: 85, y: 55, w: 10, h: 25 }] },
-    },
-  },
-  {
-    id: "warehouse", label: "Warehouse", tag: "MODEL 04", accent: "#f97316",
-    palette: {
-      geo: ["#0d0a06", "#1c1408", "#2e2010", "#4a3418", "#6a4c22", "#8a6c3a"],
-      heat: ["#1a0000", "#440000", "#880000", "#cc4400", "#ff8800", "#ffcc00", "#ffffff"],
-      sem: { bg: "#100c08", objects: [{ c: "#e74c3c", x: 5, y: 38, w: 20, h: 32 }, { c: "#2ecc71", x: 30, y: 55, w: 28, h: 22 }, { c: "#3498db", x: 60, y: 30, w: 14, h: 50 }, { c: "#f39c12", x: 78, y: 48, w: 16, h: 30 }] },
-    },
-  },
-  {
-    id: "garden", label: "Garden Scene", tag: "MODEL 05", accent: "#ec4899",
-    palette: {
-      geo: ["#060c06", "#0c1a0c", "#142a14", "#1c4020", "#286030", "#3a8844"],
-      heat: ["#000820", "#001060", "#0050c0", "#00b0e0", "#40e080", "#c0f000", "#ff8000"],
-      sem: { bg: "#060c06", objects: [{ c: "#e74c3c", x: 10, y: 60, w: 18, h: 20 }, { c: "#2ecc71", x: 32, y: 35, w: 24, h: 45 }, { c: "#3498db", x: 60, y: 42, w: 12, h: 38 }, { c: "#f39c12", x: 76, y: 55, w: 14, h: 25 }, { c: "#9b59b6", x: 88, y: 38, w: 10, h: 42 }] },
-    },
-  },
+    id: "coridoor 2", label: "Corridor Beta", tag: "SCENE 03", accent: "#22c55e",
+    videos: {
+      rawFlythrough: "/assets/coridoor 2/non_semantic_flythrough.mp4",
+      semFlythrough: "/assets/coridoor 2/semantic_flythrough .mp4",
+      geoRaw: "/assets/coridoor 2/without semantic.mp4",
+      geoSem: "/assets/coridoor 2/with Semantic.mp4",
+      original: "/assets/coridoor 2/coridoor 2 camera vedio.mp4",
+      heatmap: "/assets/coridoor 2/heatmap_flythrough.mp4",
+    }
+  }
 ];
 const ITERS_PER_MODEL = 3;
 const ITER_MS = 2800;
@@ -382,266 +375,33 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--ink);}
 @keyframes pipFloat{ 0%,100%{transform:translateY(0px);} 50%{transform:translateY(-4px);} }
 `;
 
-/* ─── Canvas Panels ──────────────────────────── */
+/* ─── Video Panels ─────────────────────────────── */
 
-// Non-semantic flythrough — warm photo-realistic feel, no color labels
-function FlythroughRawPanel({ model, tick }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = c.offsetWidth * dpr; c.height = c.offsetHeight * dpr;
-    const W = c.width, H = c.height, ctx = c.getContext("2d");
-    // Natural video gradient — warm tones
-    const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, "#0a0c14"); grad.addColorStop(0.5, "#141828"); grad.addColorStop(1, "#0d1020");
-    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
-    // Depth-based point cloud — monochrome
-    const seed = tick * 137 + model.id.charCodeAt(0);
-    for (let i = 0; i < 2400; i++) {
-      const rx = (Math.sin(i * seed * 0.0013) * 0.5 + 0.5) * W;
-      const ry = (Math.cos(i * seed * 0.0017) * 0.5 + 0.5) * H;
-      const depth = ry / H;
-      const rb = 60 + depth * 130 + Math.sin(i * 0.4 + tick * 0.05) * 30;
-      const alpha = 0.08 + depth * 0.18;
-      ctx.fillStyle = `rgba(${rb},${rb + 8},${rb + 22},${alpha})`;
-      ctx.fillRect(rx, ry, 1.2 + depth, 1.2 + depth);
-    }
-    // Environmental silhouette shapes
-    ctx.fillStyle = "rgba(255,255,255,0.018)";
-    ctx.beginPath(); ctx.moveTo(W * 0.08, H * 0.92); ctx.lineTo(W * 0.2, H * 0.42);
-    ctx.lineTo(W * 0.34, H * 0.52); ctx.lineTo(W * 0.52, H * 0.35); ctx.lineTo(W * 0.7, H * 0.48);
-    ctx.lineTo(W * 0.86, H * 0.32); ctx.lineTo(W * 0.97, H * 0.92); ctx.closePath(); ctx.fill();
-    // Scanlines for video feel
-    ctx.fillStyle = "rgba(255,255,255,0.012)";
-    for (let y = 0; y < H; y += 3) { ctx.fillRect(0, y, W, 1); }
-    // Timecode
-    ctx.fillStyle = "rgba(255,255,255,0.28)";
-    ctx.font = `bold ${W * 0.038}px DM Mono,monospace`;
-    ctx.fillText(`${String(Math.floor(tick / 60)).padStart(2, "0")}:${String(tick % 60 * 4 % 60).padStart(2, "0")}:${String(tick % 30 * 3).padStart(2, "0")}`, W * 0.04, H * 0.91);
-    // Vignette
-    const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.12, W / 2, H / 2, H * 0.85);
-    vig.addColorStop(0, "transparent"); vig.addColorStop(1, "rgba(0,0,0,0.72)");
-    ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
-    // Camera path indicator
-    const pathProgress = (tick % 120) / 120;
-    ctx.strokeStyle = "rgba(255,255,255,0.06)"; ctx.lineWidth = 1; ctx.setLineDash([3, 6]);
-    ctx.beginPath(); ctx.moveTo(W * 0.1, H * 0.7); ctx.bezierCurveTo(W * 0.3, H * 0.3, W * 0.7, H * 0.6, W * 0.9, H * 0.2); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = "rgba(255,255,255,0.55)";
-    const pt = pathProgress;
-    const bx = W * (0.1 + pt * (0.9 - 0.1)); // simplified linear approx
-    const by = H * (0.7 + pt * (0.2 - 0.7));
-    ctx.beginPath(); ctx.arc(bx, by, 3, 0, Math.PI * 2); ctx.fill();
-  }, [tick, model]);
-  return <canvas ref={ref} className="panel-canvas" style={{ width: "100%", height: "100%" }} />;
+function VideoPanel({ src, className = "panel-canvas", style = {} }) {
+  return (
+    <video
+      key={src}
+      src={src}
+      className={className}
+      autoPlay
+      loop
+      muted
+      playsInline
+      style={{ width: "100%", height: "100%", objectFit: "cover", display: "block", ...style }}
+    />
+  );
 }
 
-// Semantic flythrough — same path but with color-coded object overlays
-function FlythroughSemPanel({ model, tick }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = c.offsetWidth * dpr; c.height = c.offsetHeight * dpr;
-    const W = c.width, H = c.height, ctx = c.getContext("2d");
-    ctx.fillStyle = model.palette.sem.bg; ctx.fillRect(0, 0, W, H);
-    // Ground plane gradient
-    const gp = ctx.createLinearGradient(0, H * 0.6, 0, H);
-    gp.addColorStop(0, "rgba(255,255,255,0.018)"); gp.addColorStop(1, "rgba(255,255,255,0.055)");
-    ctx.fillStyle = gp; ctx.fillRect(0, H * 0.6, W, H * 0.4);
-    // Perspective grid lines
-    ctx.strokeStyle = "rgba(255,255,255,0.04)"; ctx.lineWidth = 0.5;
-    for (let i = 0; i < 8; i++) {
-      ctx.beginPath(); ctx.moveTo(W * 0.5, H * 0.55); ctx.lineTo(W * (i / 7), H); ctx.stroke();
-    }
-    for (let i = 0; i < 5; i++) {
-      const y = H * (0.6 + i * 0.1);
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-    }
-    // Semantic objects with perspective scaling
-    model.palette.sem.objects.forEach((obj, i) => {
-      const perspScale = 0.5 + (obj.y / 100) * 0.7;
-      const pulse = Math.sin(tick * 0.12 + i * 1.1) * 2.5;
-      const x = W * (obj.x / 100), y = H * (obj.y / 100);
-      const w = W * (obj.w / 100) * perspScale, h = H * (obj.h / 100) * perspScale;
-      // Shadow
-      ctx.fillStyle = "rgba(0,0,0,0.3)";
-      ctx.fillRect(x + w * 0.1, y + h - 4, w * 0.8, 5);
-      // Object fill
-      ctx.shadowBlur = 14 + pulse; ctx.shadowColor = obj.c + "77";
-      ctx.fillStyle = obj.c + "44"; ctx.fillRect(x, y, w, h);
-      ctx.shadowBlur = 0;
-      // Object outline
-      ctx.strokeStyle = obj.c + "cc"; ctx.lineWidth = 1.5; ctx.strokeRect(x, y, w, h);
-      // Label chip
-      ctx.fillStyle = obj.c;
-      ctx.fillRect(x, y - 14, W * 0.055, 13);
-      ctx.fillStyle = "rgba(0,0,0,0.9)";
-      ctx.font = `${W * 0.018}px DM Mono,monospace`;
-      ctx.fillText(`OBJ_${String(i + 1).padStart(2, "0")}`, x + 2, y - 3);
-    });
-    // Camera scan line
-    const sv = (tick % 80) / 80 * H;
-    const sg = ctx.createLinearGradient(0, sv - 10, 0, sv + 10);
-    sg.addColorStop(0, "transparent"); sg.addColorStop(0.5, "rgba(139,92,246,0.25)"); sg.addColorStop(1, "transparent");
-    ctx.fillStyle = sg; ctx.fillRect(0, sv - 10, W, 20);
-    // Vignette
-    const depth = ctx.createLinearGradient(0, 0, 0, H);
-    depth.addColorStop(0, "rgba(0,0,0,0.4)"); depth.addColorStop(0.45, "transparent"); depth.addColorStop(1, "rgba(0,0,0,0.55)");
-    ctx.fillStyle = depth; ctx.fillRect(0, 0, W, H);
-  }, [tick, model]);
-  return <canvas ref={ref} className="panel-canvas" style={{ width: "100%", height: "100%" }} />;
-}
+function FlythroughRawPanel({ model }) { return <VideoPanel src={model.videos.rawFlythrough} />; }
+function FlythroughSemPanel({ model }) { return <VideoPanel src={model.videos.semFlythrough} />; }
+function GeoPanel({ model }) { return <VideoPanel src={model.videos.geoRaw} />; }
+function GeoSemPanel({ model }) { return <VideoPanel src={model.videos.geoSem} />; }
 
-// Geometry panel — 3D structure, point cloud + depth layers
-function GeoPanel({ model, tick }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = c.offsetWidth * dpr; c.height = c.offsetHeight * dpr;
-    const W = c.width, H = c.height, ctx = c.getContext("2d");
-    const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, model.palette.geo[0]); grad.addColorStop(1, model.palette.geo[2]);
-    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
-    const cols = 34, rows = 20;
-    for (let r = 0; r < rows; r++) for (let co = 0; co < cols; co++) {
-      const nx = co / cols, ny = r / rows;
-      let d = 0.1 + ny * 0.8 + Math.sin(nx * 6 + tick * 0.06) * 0.05;
-      if (Math.sqrt((nx - 0.5) ** 2 + (ny - 0.55) ** 2) < 0.18) d *= 0.34;
-      ctx.fillStyle = model.palette.geo[Math.min(5, Math.floor(d * 5))] + "cc";
-      ctx.fillRect(co * (W / cols), r * (H / rows), W / cols - 1, H / rows - 1);
-    }
-    for (let i = 0; i < 130; i++) {
-      const a = i / 130 * Math.PI * 2, r2 = 0.24 + Math.sin(i * 0.7 + tick * 0.04) * 0.17;
-      ctx.beginPath(); ctx.arc(W * (0.5 + Math.cos(a) * r2 * 0.78), H * (0.5 + Math.sin(a) * r2 * 0.48), 1.6, 0, Math.PI * 2);
-      ctx.fillStyle = model.palette.geo[3] + "99"; ctx.fill();
-    }
-    const sx = (tick % 100) / 100 * W;
-    const sg = ctx.createLinearGradient(sx - 22, 0, sx + 22, 0);
-    sg.addColorStop(0, "transparent"); sg.addColorStop(0.5, "rgba(14,165,233,0.38)"); sg.addColorStop(1, "transparent");
-    ctx.fillStyle = sg; ctx.fillRect(sx - 22, 0, 44, H);
-    ctx.strokeStyle = "rgba(14,165,233,0.1)"; ctx.lineWidth = 1;
-    for (let i = 0; i < 7; i++) {
-      ctx.beginPath(); ctx.moveTo(W * 0.08, H * (0.28 + i * 0.09));
-      ctx.lineTo(W * 0.92, H * (0.32 + i * 0.076 + Math.sin(i + tick * 0.03) * 0.03)); ctx.stroke();
-    }
-  }, [tick, model]);
-  return <canvas ref={ref} className="panel-canvas" style={{ width: "100%", height: "100%" }} />;
+function OriginalPiP({ model }) {
+  return <VideoPanel src={model.videos.original} className="" style={{ position: "absolute", inset: 0 }} />;
 }
-
-// Geometry + Semantic overlay — geo base with sem labels fused
-function GeoSemPanel({ model, tick }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = c.offsetWidth * dpr; c.height = c.offsetHeight * dpr;
-    const W = c.width, H = c.height, ctx = c.getContext("2d");
-    // Draw geo base
-    const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, model.palette.geo[0]); grad.addColorStop(1, model.palette.geo[1]);
-    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
-    const cols = 28, rows = 16;
-    for (let r = 0; r < rows; r++) for (let co = 0; co < cols; co++) {
-      const nx = co / cols, ny = r / rows;
-      let d = 0.1 + ny * 0.8 + Math.sin(nx * 6 + tick * 0.06) * 0.05;
-      if (Math.sqrt((nx - 0.5) ** 2 + (ny - 0.55) ** 2) < 0.18) d *= 0.34;
-      ctx.fillStyle = model.palette.geo[Math.min(5, Math.floor(d * 5))] + "88";
-      ctx.fillRect(co * (W / cols), r * (H / rows), W / cols - 1, H / rows - 1);
-    }
-    // Overlay semantic labels with geo-tinted transparency
-    model.palette.sem.objects.forEach((obj, i) => {
-      const pulse = Math.sin(tick * 0.1 + i * 1.3) * 2;
-      const x = W * (obj.x / 100), y = H * (obj.y / 100), w = W * (obj.w / 100), h = H * (obj.h / 100);
-      ctx.shadowBlur = 12 + pulse; ctx.shadowColor = obj.c + "88";
-      ctx.fillStyle = obj.c + "55"; ctx.fillRect(x + pulse / 2, y + pulse / 2, w - pulse, h - pulse);
-      ctx.shadowBlur = 0;
-      ctx.strokeStyle = obj.c; ctx.lineWidth = 1.5; ctx.strokeRect(x, y, w, h);
-      // Geo wireframe inside label
-      ctx.strokeStyle = obj.c + "33"; ctx.lineWidth = 0.5;
-      for (let g = 1; g < 3; g++) {
-        ctx.beginPath(); ctx.moveTo(x, y + h * g / 3); ctx.lineTo(x + w, y + h * g / 3); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(x + w * g / 3, y); ctx.lineTo(x + w * g / 3, y + h); ctx.stroke();
-      }
-      ctx.fillStyle = obj.c + "dd"; ctx.font = `${W * 0.022}px DM Mono,monospace`;
-      ctx.fillText(`GEO_${String(i + 1).padStart(2, "0")}`, x + 3, y + W * 0.022 + 3);
-    });
-    // Scan sweep
-    const sx = (tick % 100) / 100 * W;
-    const sg = ctx.createLinearGradient(sx - 18, 0, sx + 18, 0);
-    sg.addColorStop(0, "transparent"); sg.addColorStop(0.5, "rgba(139,92,246,0.22)"); sg.addColorStop(1, "transparent");
-    ctx.fillStyle = sg; ctx.fillRect(sx - 18, 0, 36, H);
-    // Vignette
-    const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.1, W / 2, H / 2, H * 0.75);
-    vig.addColorStop(0, "transparent"); vig.addColorStop(1, "rgba(0,0,0,0.5)");
-    ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
-  }, [tick, model]);
-  return <canvas ref={ref} className="panel-canvas" style={{ width: "100%", height: "100%" }} />;
-}
-
-// Original video — PiP floating window
-function OriginalPiP({ model, tick }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = c.offsetWidth * dpr; c.height = c.offsetHeight * dpr;
-    const W = c.width, H = c.height, ctx = c.getContext("2d");
-    const grad = ctx.createLinearGradient(0, 0, W, H);
-    grad.addColorStop(0, "#0a0c14"); grad.addColorStop(1, "#141828");
-    ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
-    const seed = tick * 137 + model.id.charCodeAt(0);
-    for (let i = 0; i < 900; i++) {
-      const rx = (Math.sin(i * seed * 0.0013) * 0.5 + 0.5) * W;
-      const ry = (Math.cos(i * seed * 0.0017) * 0.5 + 0.5) * H;
-      const rb = 70 + Math.sin(i * 0.4 + tick * 0.05) * 50;
-      ctx.fillStyle = `rgba(${rb},${rb + 14},${rb + 32},${0.12 + Math.sin(i * 0.3) * 0.06})`;
-      ctx.fillRect(rx, ry, 1.2, 1.2);
-    }
-    ctx.fillStyle = "rgba(255,255,255,0.015)";
-    ctx.beginPath(); ctx.moveTo(W * 0.1, H * 0.9); ctx.lineTo(W * 0.22, H * 0.45);
-    ctx.lineTo(W * 0.36, H * 0.54); ctx.lineTo(W * 0.55, H * 0.37); ctx.lineTo(W * 0.72, H * 0.5);
-    ctx.lineTo(W * 0.88, H * 0.34); ctx.lineTo(W * 0.96, H * 0.9); ctx.closePath(); ctx.fill();
-    ctx.fillStyle = "rgba(255,255,255,0.38)";
-    ctx.font = `bold ${W * 0.072}px DM Mono,monospace`;
-    ctx.fillText(`${String(Math.floor(tick / 60)).padStart(2, "0")}:${String(tick % 60 * 4 % 60).padStart(2, "0")}`, W * 0.06, H * 0.88);
-    const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.1, W / 2, H / 2, H * 0.78);
-    vig.addColorStop(0, "transparent"); vig.addColorStop(1, "rgba(0,0,0,0.68)");
-    ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
-    // REC indicator
-    ctx.fillStyle = `rgba(249,115,22,${0.7 + Math.sin(tick * 0.15) * 0.3})`;
-    ctx.beginPath(); ctx.arc(W * 0.88, H * 0.12, W * 0.025, 0, Math.PI * 2); ctx.fill();
-  }, [tick, model]);
-  return <canvas ref={ref} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block" }} />;
-}
-
-// Heatmap — PiP floating window
-function HeatPiP({ model, tick }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const c = ref.current; if (!c) return;
-    const dpr = window.devicePixelRatio || 1;
-    c.width = c.offsetWidth * dpr; c.height = c.offsetHeight * dpr;
-    const W = c.width, H = c.height, ctx = c.getContext("2d");
-    const cols = 22, rows = 14;
-    for (let r = 0; r < rows; r++) for (let co = 0; co < cols; co++) {
-      let d = 0.1 + r / rows * 0.75;
-      d += Math.sin(co / cols * 5 + tick * 0.07) * 0.1 + Math.cos(r / rows * 4 - tick * 0.05) * 0.08;
-      const blob = (co / cols - 0.35) ** 2 + (r / rows - 0.5) ** 2;
-      if (blob < 0.025) d = 0.08 + blob * 10;
-      ctx.fillStyle = model.palette.heat[Math.min(6, Math.floor(Math.max(0, Math.min(1, d)) * 7))] + "e0";
-      ctx.fillRect(co * (W / cols), r * (H / rows), W / cols + 1, H / rows + 1);
-    }
-    const pr = (tick % 40) / 40;
-    ctx.beginPath(); ctx.arc(W * 0.36, H * 0.52, H * (0.06 + pr * 0.18), 0, Math.PI * 2);
-    ctx.strokeStyle = `rgba(255,255,0,${0.4 * (1 - pr)})`; ctx.lineWidth = 1.5; ctx.stroke();
-    const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.06, W / 2, H / 2, H * 0.65);
-    vig.addColorStop(0, "transparent"); vig.addColorStop(1, "rgba(0,0,0,0.38)");
-    ctx.fillStyle = vig; ctx.fillRect(0, 0, W, H);
-  }, [tick, model]);
-  return <canvas ref={ref} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block" }} />;
+function HeatPiP({ model }) {
+  return <VideoPanel src={model.videos.heatmap} className="" style={{ position: "absolute", inset: 0 }} />;
 }
 
 /* ─── DemoSection ────────────────────────────── */

@@ -70,7 +70,7 @@ def load_data(project_root: str):
         focals: (N,) focal lengths in pixels (for DUSt3R image resolution)
         image_shapes: (N, 2) as (H, W)
     """
-    ply_path = os.path.join(project_root, "outputs", "final", "semantic_world.ply")
+    ply_path = os.path.join(project_root, "outputs", "geometry", "reconstruction.ply")
     poses_path = os.path.join(project_root, "outputs", "geometry", "poses.npz")
 
     if not os.path.exists(ply_path):

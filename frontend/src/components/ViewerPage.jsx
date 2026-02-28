@@ -1,7 +1,7 @@
-import { useState, Suspense, useMemo, useRef, useEffect } from "react";
+import { useState, Suspense, useMemo, useRef, useEffect, useCallback } from "react";
 import { BASE_URL } from "../api";
-import { Canvas, useLoader, useFrame, useThree } from "@react-three/fiber";
-import { OrbitControls, Points, PointMaterial, ContactShadows, Grid } from "@react-three/drei";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { OrbitControls, ContactShadows, Grid } from "@react-three/drei";
 import { PLYLoader } from "three-stdlib";
 import * as THREE from "three";
 
@@ -114,18 +114,45 @@ const css = `
 }
 .v-loader-txt { font-family:'DM Mono',monospace; font-size:0.62rem; color:rgba(255,255,255,0.24); letter-spacing:0.1em; }
 
-/* No scene */
+/* No scene / drop zone */
 .v-empty {
   position:absolute; inset:0; z-index:10;
   display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px;
+  transition: all 0.2s ease;
 }
 .v-empty-icon {
   width:58px; height:58px; border-radius:14px;
   border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.03);
   display:flex; align-items:center; justify-content:center;
   font-size:1.5rem; color:rgba(255,255,255,0.2);
+  transition: all 0.25s ease;
 }
-.v-empty p { font-size:0.82rem; color:rgba(255,255,255,0.3); text-align:center; max-width:190px; line-height:1.65; }
+.v-empty p { font-size:0.82rem; color:rgba(255,255,255,0.3); text-align:center; max-width:220px; line-height:1.65; }
+
+.v-empty.drag-over {
+  background: rgba(14,165,233,0.06);
+  border: 2px dashed rgba(14,165,233,0.35);
+  border-radius: 12px;
+  margin: 12px;
+}
+.v-empty.drag-over .v-empty-icon {
+  border-color: rgba(14,165,233,0.35);
+  background: rgba(14,165,233,0.08);
+  color: rgba(14,165,233,0.6);
+  transform: scale(1.1);
+}
+
+.file-input-label {
+  display:inline-flex; align-items:center; gap:7px;
+  padding:8px 18px; background:rgba(255,255,255,0.06);
+  border:1px solid rgba(255,255,255,0.1); border-radius:8px;
+  font-family:'DM Sans',sans-serif; font-size:0.8rem; color:rgba(255,255,255,0.5);
+  cursor:pointer; transition:all 0.18s;
+}
+.file-input-label:hover {
+  border-color:rgba(14,165,233,0.35); color:rgba(14,165,233,0.7);
+  background:rgba(14,165,233,0.06);
+}
 
 /* Right panel controls */
 .layer-btn {
@@ -159,6 +186,33 @@ const css = `
 }
 .toggle-sw.on .toggle-knob { transform:translateX(13px); background:#0ea5e9; }
 
+/* Background color picker */
+.bg-presets {
+  display:flex; gap:5px; flex-wrap:wrap; margin-top:4px;
+}
+.bg-swatch {
+  width:22px; height:22px; border-radius:6px; border:2px solid transparent;
+  cursor:pointer; transition:all 0.15s; flex-shrink:0;
+}
+.bg-swatch:hover { transform:scale(1.15); }
+.bg-swatch.active { border-color:rgba(14,165,233,0.6); box-shadow:0 0 8px rgba(14,165,233,0.25); }
+.bg-custom-row {
+  display:flex; align-items:center; gap:7px; margin-top:6px;
+}
+.bg-hex-input {
+  flex:1; padding:4px 8px; background:rgba(255,255,255,0.04);
+  border:1px solid rgba(255,255,255,0.08); border-radius:5px;
+  font-family:'DM Mono',monospace; font-size:0.62rem;
+  color:rgba(255,255,255,0.5); outline:none; transition:border-color 0.18s;
+}
+.bg-hex-input:focus { border-color:rgba(14,165,233,0.35); }
+.bg-color-input {
+  width:22px; height:22px; padding:0; border:none; border-radius:5px;
+  cursor:pointer; background:transparent;
+}
+.bg-color-input::-webkit-color-swatch-wrapper { padding:0; }
+.bg-color-input::-webkit-color-swatch { border:1px solid rgba(255,255,255,0.12); border-radius:5px; }
+
 .export-btn {
   display:flex; align-items:center; gap:7px; width:100%; padding:8px 11px;
   background:none; border:1px solid rgba(255,255,255,0.06);
@@ -169,58 +223,163 @@ const css = `
 .export-btn:hover { border-color:rgba(255,255,255,0.12); color:rgba(255,255,255,0.54); }
 `;
 
+/* ─── Scene background sync component ──────────────────────────────── */
+function SceneBg({ color }) {
+  const { scene } = useThree();
+  useEffect(() => { scene.background = new THREE.Color(color); }, [color, scene]);
+  return null;
+}
+
+/* ─── Auto-center camera to fit geometry bounding box ──────────────── */
 function CameraFit({ geometry }) {
   const { camera } = useThree();
   useEffect(() => {
     if (!geometry) return;
-    geometry.computeBoundingBox();
-    const box = geometry.boundingBox; if (!box) return;
-    const size = new THREE.Vector3(); box.getSize(size);
-    const mx = Math.max(size.x, size.y, size.z);
-    camera.position.set(0, mx * 0.35, mx * 1.55);
-    camera.near = mx * 0.01; camera.far = mx * 12;
+    // Force camera to a known-good position for a 10-unit normalized scene
+    camera.position.set(0, 5, 15);
+    camera.lookAt(0, 0, 0);
+    camera.near = 0.01;
+    camera.far = 1000;
     camera.updateProjectionMatrix();
+    console.log("[CameraFit] Camera set to (0, 5, 15) → lookAt(0, 0, 0)");
   }, [geometry, camera]);
   return null;
 }
 
-function PlyModel({ url, layers, autoRotate }) {
-  const geometry = useLoader(PLYLoader, url);
+/* ─── Point cloud model (from URL or parsed BufferGeometry) ──────── */
+/*
+ * CRITICAL: We use lowercase <points> and <pointsMaterial> — these are
+ * raw React Three Fiber primitives that map directly to THREE.Points
+ * and THREE.PointsMaterial.
+ *
+ * DO NOT use <Points> / <PointMaterial> from @react-three/drei — those
+ * are an instanced-point system designed for <Point> children. They
+ * silently IGNORE the geometry prop, rendering zero points.
+ */
+function PlyModel({ url, localGeo, layers, autoRotate }) {
+  const [remoteGeo, setRemoteGeo] = useState(null);
   const groupRef = useRef();
-  useFrame((_, dt) => { if (autoRotate && groupRef.current) groupRef.current.rotation.y += dt * 0.14; });
 
+  // Load from URL if provided (and no local geometry)
+  useEffect(() => {
+    if (localGeo || !url) { setRemoteGeo(null); return; }
+    console.log("[PlyModel] Loading remote PLY:", url);
+    const loader = new PLYLoader();
+    loader.load(
+      url,
+      (geo) => {
+        console.log("[PlyModel] Remote PLY loaded, vertices:", geo.attributes.position?.count);
+        setRemoteGeo(geo);
+      },
+      undefined,
+      (err) => console.error("[PlyModel] Remote PLY load failed:", err)
+    );
+  }, [url, localGeo]);
+
+  useFrame((_, dt) => {
+    if (autoRotate && groupRef.current) groupRef.current.rotation.y += dt * 0.14;
+  });
+
+  const rawGeo = localGeo || remoteGeo;
+
+  // ── Bulletproof Auto-Normalize Pipeline ──────────────────────
+  // Guarantees the geometry is centered at (0,0,0) and scaled to
+  // exactly 10 units max extent, regardless of input coordinates.
   const geo = useMemo(() => {
-    if (!geometry) return null;
-    const g = geometry.clone();
+    if (!rawGeo) return null;
+
+    const vtxCount = rawGeo.attributes.position?.count ?? 0;
+    console.log("[PlyModel] ── Normalizing geometry ──");
+    console.log("  Input vertices:", vtxCount);
+    console.log("  Attributes:", Object.keys(rawGeo.attributes));
+    console.log("  Has colors:", rawGeo.hasAttribute("color"));
+
+    if (vtxCount === 0) {
+      console.error("[PlyModel] Geometry has 0 vertices!");
+      return null;
+    }
+
+    const g = rawGeo.clone();
+
+    // Strip empty index (point clouds don't need it)
     if (g.index && g.index.count === 0) g.setIndex(null);
+
+    // Step 1: Compute bounds
     g.computeBoundingBox();
-    const box = g.boundingBox; if (!box) return g;
-    const c = new THREE.Vector3(); box.getCenter(c); g.translate(-c.x, -c.y, -c.z);
-    const sz = new THREE.Vector3(); box.getSize(sz);
-    const mx = Math.max(sz.x, sz.y, sz.z);
-    if (mx > 0) { const s = 6 / mx; g.scale(s, s, s); }
-    if (g.index) g.computeVertexNormals();
+    g.computeBoundingSphere();
+    const box = g.boundingBox;
+    if (!box) { console.error("[PlyModel] computeBoundingBox returned null!"); return g; }
+
+    const rawMin = box.min.toArray().map(v => v.toFixed(4));
+    const rawMax = box.max.toArray().map(v => v.toFixed(4));
+    console.log("  Raw BBox min:", rawMin);
+    console.log("  Raw BBox max:", rawMax);
+
+    // Step 2: Center to origin
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    g.translate(-center.x, -center.y, -center.z);
+    console.log("  Centered by translating:", center.toArray().map(v => (-v).toFixed(4)));
+
+    // Step 3: Normalize scale → max extent = exactly 10.0 units
+    const sz = new THREE.Vector3();
+    box.getSize(sz);
+    const maxDim = Math.max(sz.x, sz.y, sz.z);
+    if (maxDim > 0) {
+      const TARGET_SIZE = 10.0;
+      const scaleFactor = TARGET_SIZE / maxDim;
+      g.scale(scaleFactor, scaleFactor, scaleFactor);
+      console.log("  Scale factor:", scaleFactor.toFixed(6), `(${maxDim.toFixed(4)} → ${TARGET_SIZE})`);
+    }
+
+    // Recompute bounds after transform
+    g.computeBoundingBox();
+    g.computeBoundingSphere();
+    console.log("  Final BBox min:", g.boundingBox.min.toArray().map(v => v.toFixed(2)));
+    console.log("  Final BBox max:", g.boundingBox.max.toArray().map(v => v.toFixed(2)));
+    console.log("  Final bounding sphere radius:", g.boundingSphere.radius.toFixed(2));
+    console.log("[PlyModel] ── Normalization complete ──");
+
     return g;
-  }, [geometry]);
+  }, [rawGeo]);
 
   if (!geo) return null;
+
   const hasColors = geo.hasAttribute("color");
   const hasFaces = geo.index && geo.index.count > 0;
 
+  // Step 4: Fixed point size for 10-unit normalized scene
+  const POINT_SIZE = 0.05;
+
   return (
     <group ref={groupRef}>
+      {/* ── POINT CLOUD ──
+        CRITICAL: Use lowercase <points> (THREE.Points primitive).
+        NOT <Points> from drei (which is an instanced system that ignores geometry).
+      */}
       {layers.points && (
-        <Points geometry={geo}>
-          <PointMaterial size={0.012} vertexColors={hasColors} color={hasColors ? "white" : "#60a5fa"}
-            sizeAttenuation transparent opacity={0.88} />
-        </Points>
+        <points geometry={geo}>
+          <pointsMaterial
+            size={POINT_SIZE}
+            vertexColors={hasColors}
+            color={hasColors ? 0xffffff : 0x60a5fa}
+            sizeAttenuation={true}
+            transparent={true}
+            opacity={0.92}
+            depthWrite={false}
+          />
+        </points>
       )}
+
+      {/* ── MESH SURFACE (if PLY has faces) ── */}
       {hasFaces && layers.solid && (
         <mesh geometry={geo} castShadow receiveShadow>
           <meshStandardMaterial vertexColors={hasColors} color={hasColors ? "white" : "#60a5fa"}
             side={THREE.DoubleSide} roughness={0.55} metalness={0.08} />
         </mesh>
       )}
+
+      {/* ── WIREFRAME ── */}
       {hasFaces && layers.wireframe && (
         <mesh geometry={geo}>
           <meshBasicMaterial color="#7c3aed" wireframe transparent opacity={0.22} side={THREE.DoubleSide} />
@@ -237,11 +396,30 @@ const LAYERS = [
   { key: "wireframe", label: "Wireframe", color: "#7c3aed" },
 ];
 
+const BG_PRESETS = [
+  { label: "Void", hex: "#0d0d0d" },
+  { label: "Charcoal", hex: "#1a1a2e" },
+  { label: "Slate", hex: "#2d3436" },
+  { label: "Navy", hex: "#0a1628" },
+  { label: "White", hex: "#f5f5f5" },
+  { label: "Ember", hex: "#1a0a0a" },
+];
+
 export default function ViewerPage({ setPage, jobResult }) {
   const [layers, setLayers] = useState({ points: true, solid: false, wireframe: true });
   const [autoRot, setAutoRot] = useState(false);
   const [loading, setLoading] = useState(true);
   const [fps, setFps] = useState(60);
+  const [bgColor, setBgColor] = useState("#0d0d0d");
+  const [customHex, setCustomHex] = useState("#0d0d0d");
+
+  // ─── Local PLY upload state ──────────────────────────────────
+  const [localGeo, setLocalGeo] = useState(null);
+  const [localName, setLocalName] = useState(null);
+  const [localPoints, setLocalPoints] = useState(0);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef(null);
+
   const toggle = (k) => setLayers(l => ({ ...l, [k]: !l[k] }));
 
   useEffect(() => {
@@ -251,10 +429,92 @@ export default function ViewerPage({ setPage, jobResult }) {
     return () => clearInterval(id);
   }, []);
 
+  // ─── Parse PLY from ArrayBuffer via three-stdlib PLYLoader ───
+  const parsePlyFile = useCallback((file) => {
+    if (!file.name.toLowerCase().endsWith(".ply")) {
+      alert("Please upload a .ply file");
+      return;
+    }
+    setLoading(true);
+    setLocalName(file.name);
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        console.log("[PLY Upload] ArrayBuffer size:", e.target.result.byteLength, "bytes");
+        const loader = new PLYLoader();
+        const geometry = loader.parse(e.target.result);
+        geometry.computeBoundingBox();
+        const nPoints = geometry.attributes.position
+          ? geometry.attributes.position.count : 0;
+        const hasColor = geometry.hasAttribute("color");
+        console.log("[PLY Upload] Parsed successfully:");
+        console.log("  Vertices:", nPoints);
+        console.log("  Has vertex colors:", hasColor);
+        console.log("  Attributes:", Object.keys(geometry.attributes));
+        console.log("  BBox min:", geometry.boundingBox.min.toArray());
+        console.log("  BBox max:", geometry.boundingBox.max.toArray());
+        if (nPoints === 0) {
+          alert("PLY file parsed but contains 0 vertices.");
+          setLoading(false);
+          return;
+        }
+        setLocalPoints(nPoints);
+        setLocalGeo(geometry);
+        setLoading(false);
+      } catch (err) {
+        console.error("[PLY Upload] Parse error:", err);
+        alert("Failed to parse PLY file: " + err.message);
+        setLoading(false);
+      }
+    };
+    reader.onerror = (err) => {
+      console.error("[PLY Upload] FileReader error:", err);
+      alert("Failed to read file");
+      setLoading(false);
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  // ─── Drag handlers ──────────────────────────────────────────
+  const handleDragOver = useCallback((e) => {
+    e.preventDefault(); e.stopPropagation(); setDragOver(true);
+  }, []);
+  const handleDragLeave = useCallback((e) => {
+    e.preventDefault(); e.stopPropagation(); setDragOver(false);
+  }, []);
+  const handleDrop = useCallback((e) => {
+    e.preventDefault(); e.stopPropagation(); setDragOver(false);
+    const file = e.dataTransfer?.files?.[0];
+    if (file) parsePlyFile(file);
+  }, [parsePlyFile]);
+  const handleFileSelect = useCallback((e) => {
+    const file = e.target?.files?.[0];
+    if (file) parsePlyFile(file);
+  }, [parsePlyFile]);
+
+  // ─── Background color handlers ──────────────────────────────
+  const handleBgPreset = (hex) => { setBgColor(hex); setCustomHex(hex); };
+  const handleCustomHexChange = (e) => {
+    const v = e.target.value;
+    setCustomHex(v);
+    if (/^#[0-9a-fA-F]{6}$/.test(v)) setBgColor(v);
+  };
+  const handleColorPick = (e) => {
+    setBgColor(e.target.value);
+    setCustomHex(e.target.value);
+  };
+
+  // ─── Derived state ─────────────────────────────────────────
   let plyUrl = null;
   if (jobResult?.ply_url) plyUrl = `${BASE_URL}${jobResult.ply_url}`;
   if (!plyUrl && jobResult?.filename) plyUrl = `${BASE_URL}/files/outputs/${jobResult.filename}`;
-  const sceneLabel = jobResult?.filename || "awaiting_scene.ply";
+  const hasScene = !!plyUrl || !!localGeo;
+  const sceneLabel = localName || jobResult?.filename || "awaiting_scene.ply";
+
+  const pointsDisplay = localPoints > 0
+    ? (localPoints >= 1e6 ? `${(localPoints / 1e6).toFixed(1)}M` : `${(localPoints / 1e3).toFixed(1)}K`)
+    : "1.2M";
 
   return (
     <div className="viewer-page">
@@ -266,8 +526,8 @@ export default function ViewerPage({ setPage, jobResult }) {
           <div>
             <div className="vbar-title"><em>Mirra</em> 3D Viewer</div>
             <div className="vbar-status">
-              {plyUrl
-                ? <><div className="vbar-dot" />SEMANTIC SCENE LOADED · {sceneLabel}</>
+              {hasScene
+                ? <><div className="vbar-dot" />{localGeo ? "LOCAL FILE" : "SEMANTIC SCENE"} LOADED · {sceneLabel}</>
                 : <>AWAITING SCENE</>}
             </div>
           </div>
@@ -285,7 +545,7 @@ export default function ViewerPage({ setPage, jobResult }) {
           <div>
             <div className="v-sec-lbl">Scene Stats</div>
             {[
-              { l: "Points", v: "1.2M", s: "dense cloud" },
+              { l: "Points", v: pointsDisplay, s: "dense cloud" },
               { l: "Frames", v: "240", s: "processed" },
               { l: "Depth Acc", v: "99.3%", s: "DUSt3R est." },
               { l: "Pipeline", v: "4.2s", s: "total time" },
@@ -313,16 +573,16 @@ export default function ViewerPage({ setPage, jobResult }) {
               <span style={{ width: 5, height: 5, borderRadius: "50%", background: "var(--green)", display: "inline-block", boxShadow: "0 0 6px rgba(34,197,94,0.6)" }} />
               MIRRA VIEWER · INTERACTIVE
             </div>
-            {plyUrl && <div className="hud-chip">{fps} FPS</div>}
+            {hasScene && <div className="hud-chip">{fps} FPS</div>}
           </div>
 
           <div className="v-hud-br">
             <div className="hud-hint">DRAG ORBIT · SCROLL ZOOM · SHIFT+DRAG PAN</div>
           </div>
 
-          {plyUrl ? (
+          {hasScene ? (
             <div style={{ position: "absolute", inset: 0 }}>
-              {loading && (
+              {loading && !localGeo && (
                 <div className="v-loader">
                   <div className="v-loader-ring" />
                   <div className="v-loader-txt">LOADING POINT CLOUD</div>
@@ -333,17 +593,16 @@ export default function ViewerPage({ setPage, jobResult }) {
                 dpr={[1, 2]} shadows
                 gl={{ antialias: true, powerPreference: "high-performance" }}
                 onCreated={() => setLoading(false)}
-                style={{ background: "#0d0d0d" }}
               >
-                <color attach="background" args={["#0d0d0d"]} />
-                <fog attach="fog" args={["#0d0d0d", 18, 42]} />
+                <SceneBg color={bgColor} />
+                <fog attach="fog" args={[bgColor, 40, 100]} />
                 <ambientLight intensity={0.55} />
                 <directionalLight position={[5, 8, 5]} intensity={1.2} castShadow shadow-mapSize={[2048, 2048]} />
                 <directionalLight position={[-4, 3, -4]} intensity={0.28} color="#4477ff" />
                 <pointLight position={[0, 4, 0]} intensity={0.35} />
 
                 <Suspense fallback={null}>
-                  <PlyModel url={plyUrl} layers={layers} autoRotate={autoRot} />
+                  <PlyModel url={plyUrl} localGeo={localGeo} layers={layers} autoRotate={autoRot} />
                 </Suspense>
 
                 <Grid args={[20, 20]} position={[0, -3.5, 0]}
@@ -356,11 +615,31 @@ export default function ViewerPage({ setPage, jobResult }) {
               </Canvas>
             </div>
           ) : (
-            <div className="v-empty">
-              <div className="v-empty-icon">⬡</div>
-              <p>No scene loaded. Upload a video to generate a semantic 3D environment.</p>
+            /* ── Empty state: drag-and-drop zone ── */
+            <div
+              className={`v-empty ${dragOver ? 'drag-over' : ''}`}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
+              <div className="v-empty-icon">{dragOver ? "📂" : "⬡"}</div>
+              <p>
+                {dragOver
+                  ? "Drop .ply file here"
+                  : "Drag & drop a .ply file here, or use the button below"}
+              </p>
+              <label className="file-input-label">
+                📎 Browse .PLY File
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".ply"
+                  onChange={handleFileSelect}
+                  style={{ display: "none" }}
+                />
+              </label>
               <button className="btn-secondary" style={{ fontSize: "0.82rem", marginTop: 6 }}
-                onClick={() => setPage("upload")}>Go to Upload</button>
+                onClick={() => setPage("upload")}>Or Upload Video</button>
             </div>
           )}
         </div>
@@ -388,6 +667,41 @@ export default function ViewerPage({ setPage, jobResult }) {
               <div className={`toggle-sw ${autoRot ? "on" : ""}`} onClick={() => setAutoRot(r => !r)}>
                 <div className="toggle-knob" />
               </div>
+            </div>
+          </div>
+
+          <div className="v-divider" />
+
+          {/* ── Background Color Control ── */}
+          <div>
+            <div className="v-sec-lbl">Background</div>
+            <div className="bg-presets">
+              {BG_PRESETS.map(p => (
+                <div
+                  key={p.hex}
+                  className={`bg-swatch ${bgColor === p.hex ? 'active' : ''}`}
+                  style={{ background: p.hex, boxShadow: p.hex === "#f5f5f5" ? "inset 0 0 0 1px rgba(0,0,0,0.12)" : "none" }}
+                  onClick={() => handleBgPreset(p.hex)}
+                  title={p.label}
+                />
+              ))}
+            </div>
+            <div className="bg-custom-row">
+              <input
+                type="color"
+                className="bg-color-input"
+                value={bgColor}
+                onChange={handleColorPick}
+                title="Custom color"
+              />
+              <input
+                type="text"
+                className="bg-hex-input"
+                value={customHex}
+                onChange={handleCustomHexChange}
+                placeholder="#0d0d0d"
+                maxLength={7}
+              />
             </div>
           </div>
 

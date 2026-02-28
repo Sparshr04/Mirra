@@ -21,12 +21,12 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
   <tr>
     <td width="50%">
       <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom with semantic.mp4" type="video/mp4">
+        <source src="frontend/assets/classroom/classroom_with_semantic.mp4" type="video/mp4">
       </video>
     </td>
     <td width="50%">
       <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom without semantic vedio.mp4" type="video/mp4">
+        <source src="frontend/assets/classroom/classroom_without_semantic_video.mp4" type="video/mp4">
       </video>
     </td>
   </tr>

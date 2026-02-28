@@ -1,5 +1,6 @@
 import os
 import json
+import pathlib
 import numpy as np
 import open3d as o3d
 import hydra
@@ -34,11 +35,9 @@ class FusionEngine:
         self.cfg = cfg
         print("FusionEngine initialized.")
 
-        self.project_root = (
-            hydra.utils.get_original_cwd()
-            if hasattr(hydra.utils, "get_original_cwd")
-            else os.getcwd()
-        )
+        # Resolve project root from this file's location (src/ -> parent)
+        # Works in both Hydra CLI mode and FastAPI background tasks
+        self.project_root = str(pathlib.Path(__file__).resolve().parents[1])
 
     def load_geometry(self):
         """Load point cloud from geometry engine output."""

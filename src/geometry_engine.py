@@ -5,6 +5,7 @@ import glob
 import json
 import shutil
 import time
+import pathlib
 import torch
 import numpy as np
 import cv2
@@ -95,11 +96,9 @@ class GeometryEngine:
         self.device = self._get_device()
         print(f"GeometryEngine initialized on device: {self.device}")
 
-        self.project_root = (
-            hydra.utils.get_original_cwd()
-            if hasattr(hydra.utils, "get_original_cwd")
-            else os.getcwd()
-        )
+        # Resolve project root from this file's location (src/ -> parent)
+        # Works in both Hydra CLI mode and FastAPI background tasks
+        self.project_root = str(pathlib.Path(__file__).resolve().parents[1])
         self.checkpoints_dir = os.path.join(self.project_root, "checkpoints")
         os.makedirs(self.checkpoints_dir, exist_ok=True)
 

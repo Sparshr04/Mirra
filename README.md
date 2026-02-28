@@ -28,18 +28,26 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
   </tr>
   <tr>
     <td align="center">
-      <img src="./assets/heatmap_flythrough.gif" width="400"/>
+      <img src="./assets/non_semantic_flythrough_building.gif" width="400"/>
     </td>
     <td align="center">
-      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
+      <img src="assets/semantic_flythrough_building.gif" width="400"/>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <img src="./assets/non_semantic_flythrough_building.gif" width="400"/>
+      <img src="./assets/heatmap_flythrough_corridor.gif" width="400"/>
     </td>
     <td align="center">
       <img src="./assets/semantic_flythrough.gif" width="400"/>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough_corridor.gif" width="400"/>
+    </td>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
 </table>

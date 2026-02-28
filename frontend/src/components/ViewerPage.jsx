@@ -221,6 +221,48 @@ const css = `
   cursor:pointer; margin-bottom:5px; transition:all 0.16s; text-align:left;
 }
 .export-btn:hover { border-color:rgba(255,255,255,0.12); color:rgba(255,255,255,0.54); }
+
+/* ── Glassmorphic parsing overlay ── */
+.parse-overlay {
+  position:absolute; inset:0; z-index:50;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px;
+  background:rgba(6,6,12,0.55);
+  backdrop-filter:blur(16px) saturate(1.4);
+  -webkit-backdrop-filter:blur(16px) saturate(1.4);
+  transition:opacity 0.4s ease;
+}
+.parse-overlay.fade-out {
+  opacity:0; pointer-events:none;
+}
+.parse-spinner {
+  width:52px; height:52px; position:relative;
+}
+.parse-spinner-ring {
+  position:absolute; inset:0;
+  border:2px solid rgba(255,255,255,0.06);
+  border-top-color:rgba(14,165,233,0.7);
+  border-right-color:rgba(139,92,246,0.45);
+  border-radius:50%;
+  animation:parseSpin 1s cubic-bezier(0.45,0.05,0.55,0.95) infinite;
+}
+.parse-spinner-dot {
+  position:absolute; top:50%; left:50%;
+  width:8px; height:8px; margin:-4px;
+  background:rgba(14,165,233,0.65);
+  border-radius:50%; box-shadow:0 0 14px rgba(14,165,233,0.5);
+  animation:parsePulse 1.2s ease-in-out infinite;
+}
+@keyframes parseSpin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+@keyframes parsePulse { 0%,100%{transform:scale(1);opacity:0.6} 50%{transform:scale(1.3);opacity:1} }
+.parse-label {
+  font-family:'DM Mono',monospace; font-size:0.68rem;
+  letter-spacing:0.12em; text-transform:uppercase;
+  color:rgba(255,255,255,0.4);
+}
+.parse-sublabel {
+  font-family:'DM Sans',sans-serif; font-size:0.72rem;
+  color:rgba(255,255,255,0.2); margin-top:-12px;
+}
 `;
 
 /* ─── Scene background sync component ──────────────────────────────── */
@@ -418,6 +460,8 @@ export default function ViewerPage({ setPage, jobResult }) {
   const [localName, setLocalName] = useState(null);
   const [localPoints, setLocalPoints] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [isParsing, setIsParsing] = useState(false);
+  const [parseFileName, setParseFileName] = useState("");
   const fileInputRef = useRef(null);
 
   const toggle = (k) => setLayers(l => ({ ...l, [k]: !l[k] }));
@@ -430,43 +474,70 @@ export default function ViewerPage({ setPage, jobResult }) {
   }, []);
 
   // ─── Parse PLY from ArrayBuffer via three-stdlib PLYLoader ───
+  //
+  // CRITICAL UI THREAD HACK:
+  // PLYLoader.parse() is synchronous and locks the main thread for
+  // large binary files (50MB+ → 2-5 seconds of freeze). If we call
+  // it immediately after setState, React won't have time to paint
+  // the loading overlay before the CPU gets locked.
+  //
+  // Solution: set isParsing=true, then wrap the actual parse call
+  // in setTimeout(..., 50) to give the browser one paint frame to
+  // render the glassmorphic blur overlay before the freeze.
+  //
   const parsePlyFile = useCallback((file) => {
     if (!file.name.toLowerCase().endsWith(".ply")) {
       alert("Please upload a .ply file");
       return;
     }
-    setLoading(true);
+
+    // Show the overlay immediately
+    setIsParsing(true);
+    setParseFileName(file.name);
     setLocalName(file.name);
 
     const reader = new FileReader();
     reader.onload = (e) => {
-      try {
-        console.log("[PLY Upload] ArrayBuffer size:", e.target.result.byteLength, "bytes");
-        const loader = new PLYLoader();
-        const geometry = loader.parse(e.target.result);
-        geometry.computeBoundingBox();
-        const nPoints = geometry.attributes.position
-          ? geometry.attributes.position.count : 0;
-        const hasColor = geometry.hasAttribute("color");
-        console.log("[PLY Upload] Parsed successfully:");
-        console.log("  Vertices:", nPoints);
-        console.log("  Has vertex colors:", hasColor);
-        console.log("  Attributes:", Object.keys(geometry.attributes));
-        console.log("  BBox min:", geometry.boundingBox.min.toArray());
-        console.log("  BBox max:", geometry.boundingBox.max.toArray());
-        if (nPoints === 0) {
-          alert("PLY file parsed but contains 0 vertices.");
+      // ── setTimeout trick: let React paint the overlay first ──
+      setTimeout(() => {
+        try {
+          const bytes = e.target.result.byteLength;
+          console.log(`[PLY Upload] Parsing ${file.name} (${(bytes / 1024 / 1024).toFixed(1)} MB)...`);
+          const t0 = performance.now();
+
+          const loader = new PLYLoader();
+          const geometry = loader.parse(e.target.result);
+          geometry.computeBoundingBox();
+
+          const elapsed = (performance.now() - t0).toFixed(0);
+          const nPoints = geometry.attributes.position?.count ?? 0;
+          const hasColor = geometry.hasAttribute("color");
+          console.log(`[PLY Upload] Parsed in ${elapsed}ms:`);
+          console.log("  Vertices:", nPoints.toLocaleString());
+          console.log("  Has vertex colors:", hasColor);
+          console.log("  Attributes:", Object.keys(geometry.attributes));
+          console.log("  BBox min:", geometry.boundingBox.min.toArray().map(v => v.toFixed(4)));
+          console.log("  BBox max:", geometry.boundingBox.max.toArray().map(v => v.toFixed(4)));
+
+          if (nPoints === 0) {
+            alert("PLY file parsed but contains 0 vertices.");
+            setIsParsing(false);
+            return;
+          }
+
+          setLocalPoints(nPoints);
+          setLocalGeo(geometry);
           setLoading(false);
-          return;
+
+          // Fade out the overlay after a brief moment so the user
+          // sees the transition rather than a hard cut
+          setTimeout(() => setIsParsing(false), 300);
+        } catch (err) {
+          console.error("[PLY Upload] Parse error:", err);
+          alert("Failed to parse PLY file: " + err.message);
+          setIsParsing(false);
         }
-        setLocalPoints(nPoints);
-        setLocalGeo(geometry);
-        setLoading(false);
-      } catch (err) {
-        console.error("[PLY Upload] Parse error:", err);
-        alert("Failed to parse PLY file: " + err.message);
-        setLoading(false);
-      }
+      }, 50); // ← 50ms delay = 1 paint frame for the overlay
     };
     reader.onerror = (err) => {
       console.error("[PLY Upload] FileReader error:", err);
@@ -613,6 +684,18 @@ export default function ViewerPage({ setPage, jobResult }) {
                 <ContactShadows position={[0, -3.4, 0]} opacity={0.48} scale={12} blur={2.5} far={4} color="#000000" />
                 <OrbitControls makeDefault enableDamping dampingFactor={0.08} minDistance={1} maxDistance={30} />
               </Canvas>
+
+              {/* ── Glassmorphic parsing overlay ── */}
+              {isParsing && (
+                <div className="parse-overlay">
+                  <div className="parse-spinner">
+                    <div className="parse-spinner-ring" />
+                    <div className="parse-spinner-dot" />
+                  </div>
+                  <div className="parse-label">Parsing Spatial Data</div>
+                  <div className="parse-sublabel">{parseFileName}</div>
+                </div>
+              )}
             </div>
           ) : (
             /* ── Empty state: drag-and-drop zone ── */
@@ -622,24 +705,38 @@ export default function ViewerPage({ setPage, jobResult }) {
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
             >
-              <div className="v-empty-icon">{dragOver ? "📂" : "⬡"}</div>
-              <p>
-                {dragOver
-                  ? "Drop .ply file here"
-                  : "Drag & drop a .ply file here, or use the button below"}
-              </p>
-              <label className="file-input-label">
-                📎 Browse .PLY File
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".ply"
-                  onChange={handleFileSelect}
-                  style={{ display: "none" }}
-                />
-              </label>
-              <button className="btn-secondary" style={{ fontSize: "0.82rem", marginTop: 6 }}
-                onClick={() => setPage("upload")}>Or Upload Video</button>
+              {/* Show overlay even on the empty state if parsing has begun */}
+              {isParsing ? (
+                <div className="parse-overlay" style={{ borderRadius: 12 }}>
+                  <div className="parse-spinner">
+                    <div className="parse-spinner-ring" />
+                    <div className="parse-spinner-dot" />
+                  </div>
+                  <div className="parse-label">Parsing Spatial Data</div>
+                  <div className="parse-sublabel">{parseFileName}</div>
+                </div>
+              ) : (
+                <>
+                  <div className="v-empty-icon">{dragOver ? "📂" : "⬡"}</div>
+                  <p>
+                    {dragOver
+                      ? "Drop .ply file here"
+                      : "Drag & drop a .ply file here, or use the button below"}
+                  </p>
+                  <label className="file-input-label">
+                    📎 Browse .PLY File
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".ply"
+                      onChange={handleFileSelect}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+                  <button className="btn-secondary" style={{ fontSize: "0.82rem", marginTop: 6 }}
+                    onClick={() => setPage("upload")}>Or Upload Video</button>
+                </>
+              )}
             </div>
           )}
         </div>

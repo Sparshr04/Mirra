@@ -263,6 +263,40 @@ const css = `
   font-family:'DM Sans',sans-serif; font-size:0.72rem;
   color:rgba(255,255,255,0.2); margin-top:-12px;
 }
+
+/* Controls guide overlay */
+.controls-guide {
+  position:absolute; bottom:16px; left:16px; z-index:20;
+  pointer-events:none;
+  display:flex; flex-direction:column; gap:7px;
+  padding:12px 16px;
+  background:rgba(6,6,12,0.45);
+  backdrop-filter:blur(10px) saturate(1.3);
+  -webkit-backdrop-filter:blur(10px) saturate(1.3);
+  border:1px solid rgba(255,255,255,0.06);
+  border-radius:10px;
+}
+.cg-row {
+  display:flex; align-items:center; gap:10px;
+  font-family:'DM Sans',sans-serif; font-size:0.68rem;
+  color:rgba(255,255,255,0.32);
+}
+.cg-keys {
+  display:flex; gap:3px; flex-shrink:0;
+}
+.cg-key {
+  display:inline-flex; align-items:center; justify-content:center;
+  min-width:22px; height:20px; padding:0 5px;
+  background:rgba(255,255,255,0.06);
+  border:1px solid rgba(255,255,255,0.1);
+  border-radius:4px;
+  font-family:'DM Mono',monospace; font-size:0.55rem;
+  color:rgba(255,255,255,0.45); letter-spacing:0.03em;
+  line-height:1;
+}
+.cg-action {
+  color:rgba(255,255,255,0.25);
+}
 `;
 
 /* ─── Scene background sync component ──────────────────────────────── */
@@ -647,8 +681,24 @@ export default function ViewerPage({ setPage, jobResult }) {
             {hasScene && <div className="hud-chip">{fps} FPS</div>}
           </div>
 
-          <div className="v-hud-br">
-            <div className="hud-hint">DRAG ORBIT · SCROLL ZOOM · SHIFT+DRAG PAN</div>
+          {/* ── Controls guide (bottom-left, pointer-events-none) ── */}
+          <div className="controls-guide">
+            <div className="cg-row">
+              <div className="cg-keys"><span className="cg-key">LMB</span><span className="cg-key">Drag</span></div>
+              <span className="cg-action">Rotate</span>
+            </div>
+            <div className="cg-row">
+              <div className="cg-keys"><span className="cg-key">RMB</span><span className="cg-key">Drag</span></div>
+              <span className="cg-action">Pan</span>
+            </div>
+            <div className="cg-row">
+              <div className="cg-keys"><span className="cg-key">Scroll</span></div>
+              <span className="cg-action">Zoom</span>
+            </div>
+            <div className="cg-row">
+              <div className="cg-keys"><span className="cg-key">⇧</span><span className="cg-key">LMB</span></div>
+              <span className="cg-action">Pan (alt)</span>
+            </div>
           </div>
 
           {hasScene ? (
@@ -682,7 +732,19 @@ export default function ViewerPage({ setPage, jobResult }) {
                   fadeDistance={16} fadeStrength={1} infiniteGrid />
 
                 <ContactShadows position={[0, -3.4, 0]} opacity={0.48} scale={12} blur={2.5} far={4} color="#000000" />
-                <OrbitControls makeDefault enableDamping dampingFactor={0.08} minDistance={1} maxDistance={30} />
+                <OrbitControls
+                  makeDefault
+                  enableDamping dampingFactor={0.08}
+                  enableRotate={true}
+                  enablePan={true}
+                  enableZoom={true}
+                  minDistance={0.5}
+                  maxDistance={60}
+                  maxPolarAngle={Math.PI}    /* Full vertical rotation — no floor clamp */
+                  minPolarAngle={0}           /* Allow looking straight down */
+                  maxAzimuthAngle={Infinity}  /* No horizontal limits */
+                  minAzimuthAngle={-Infinity}
+                />
               </Canvas>
 
               {/* ── Glassmorphic parsing overlay ── */}

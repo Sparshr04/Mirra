@@ -7,7 +7,7 @@
 [![React](https://img.shields.io/badge/React-20232A?style=flat&logo=react&logoColor=61DAFB)](https://react.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Hackathon Winner](https://img.shields.io/badge/%F0%9F%8F%86-Hackathon%20Winner-gold.svg)]()
+
 
 A state-of-the-art pipeline extracting real-world video into metric-semantic 3D environments using DUSt3R geometry and SAM 2 segmentation.
 
@@ -28,18 +28,26 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
   </tr>
   <tr>
     <td align="center">
-      <img src="./assets/heatmap_flythrough.gif" width="400"/>
+      <img src="./assets/non_semantic_flythrough_building.gif" width="400"/>
     </td>
     <td align="center">
-      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
+      <img src="assets/semantic_flythrough_building.gif" width="400"/>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
+      <img src="./assets/heatmap_flythrough_corridor.gif" width="400"/>
     </td>
     <td align="center">
       <img src="./assets/semantic_flythrough.gif" width="400"/>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough_corridor.gif" width="400"/>
+    </td>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
 </table>

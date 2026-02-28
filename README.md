@@ -17,53 +17,29 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
 
 ## Visual Results
 
-<table align="center" width="100%">
+<table align="center">
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom_with_semantic.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/classroom_with_semantic.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom_without_semantic_video.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/classroom_without_semantic_video.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/heatmap_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/heatmap_flythrough.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/heatmap_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
-    </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/semantic_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
 </table>

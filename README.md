@@ -33,12 +33,12 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
   <tr>
     <td width="50%">
       <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/heatmap_flythrough .mp4" type="video/mp4">
+        <source src="frontend/assets/classroom/heatmap_flythrough.mp4" type="video/mp4">
       </video>
     </td>
     <td width="50%">
       <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/non_semantic_flythrough .mp4" type="video/mp4">
+        <source src="frontend/assets/classroom/non_semantic_flythrough.mp4" type="video/mp4">
       </video>
     </td>
   </tr>
@@ -62,7 +62,7 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
     </td>
     <td width="50%">
       <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/semantic_flythrough .mp4" type="video/mp4">
+        <source src="frontend/assets/coridoor 2/semantic_flythrough.mp4" type="video/mp4">
       </video>
     </td>
   </tr>

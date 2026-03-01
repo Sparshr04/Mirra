@@ -11,7 +11,7 @@ stride: 45
 data:
   raw: "data/raw"
   processed: "data/processed"
-
+  
 outputs:
   geometry: "outputs/geometry"
   semantics: "outputs/semantics"

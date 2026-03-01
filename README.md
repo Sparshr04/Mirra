@@ -104,3 +104,20 @@ npm start
     ├── geometry_engine.py   # DUSt3R depth and pose estimation
     └── semantic_engine.py   # SAM 2 video segmentation
 ```
+
+## Third-Party Dependencies
+
+Mirra uses the following open-source projects:
+
+- DUSt3R — Licensed under
+- Segment Anything (Meta)
+
+These projects remain under their respective licenses.
+Mirra does not claim ownership of these components.
+Mirra is licensed under MIT.
+
+Mirra depends on DUSt3R (CC BY-NC-SA 4.0),
+which restricts commercial usage.
+
+Users are responsible for complying with DUSt3R's license.
+

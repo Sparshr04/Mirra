@@ -135,11 +135,15 @@ class GeometryEngine:
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def _get_device(self):
-        """Check for MPS availability and return the appropriate device."""
-        if torch.backends.mps.is_available() and self.cfg.device == "mps":
-            return "mps"
-        elif torch.cuda.is_available() and self.cfg.device == "cuda":
+        """Check for hardware availability and return the appropriate device."""
+        if torch.cuda.is_available():
+            if getattr(torch.version, "hip", None) is not None:
+                print(
+                    "AMD ROCm / HIP detected. Utilizing AMD Instinct/Radeon acceleration."
+                )
             return "cuda"
+        elif torch.backends.mps.is_available() and self.cfg.device == "mps":
+            return "mps"
         else:
             return "cpu"
 
@@ -380,7 +384,9 @@ class GeometryEngine:
         )
 
         # batch_size=1 is crucial for MPS memory safety
-        output = inference(pairs, self.model, self.device, batch_size=1)
+        # Dynamic batch_size: 16 for AMD Instinct, 1 for Edge fallback
+        batch_size = 16 if getattr(torch.version, "hip", None) is not None else 1
+        output = inference(pairs, self.model, self.device, batch_size=batch_size)
         print("✅ Pairwise inference complete.")
         return output
 

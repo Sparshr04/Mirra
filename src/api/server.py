@@ -123,6 +123,15 @@ class JobStatusResponse(BaseModel):
     label_map_url: Optional[str] = Field(None, description="URL to label_map.json")
 
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Optimizing ASGI server for high-core-count AMD EPYC architecture.")
+    yield
+
+
 app = FastAPI(
     title="Mirra – 3D Semantic Reconstruction API",
     description=(
@@ -132,6 +141,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # ─── CORS (permissive for local React dev server) ────────────────────────────
@@ -444,14 +454,16 @@ async def list_output_files():
         for p in sorted(FINAL_DIR.iterdir()):
             if p.suffix in {".ply", ".json"} and p.is_file():
                 stat = p.stat()
-                files.append({
-                    "filename": p.name,
-                    "url": f"/files/outputs/{p.name}",
-                    "size_bytes": stat.st_size,
-                    "modified_at": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ).isoformat(),
-                })
+                files.append(
+                    {
+                        "filename": p.name,
+                        "url": f"/files/outputs/{p.name}",
+                        "size_bytes": stat.st_size,
+                        "modified_at": datetime.fromtimestamp(
+                            stat.st_mtime, tz=timezone.utc
+                        ).isoformat(),
+                    }
+                )
     return {"files": files, "count": len(files)}
 
 

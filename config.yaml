@@ -1,17 +1,17 @@
 # Configuration for Semantic World Reconstruction Pipeline
 
 # Hardware / Compute
-device: "mps"  # Metal Performance Shaders for Apple Silicon
+device: "cuda" #cuda/cpu/mps
 
 # Reconstruction Parameters
 resolution: 256 #512
-stride: 35
+stride: 45 #5
 
 # Paths
 data:
   raw: "data/raw"
   processed: "data/processed"
-
+  
 outputs:
   geometry: "outputs/geometry"
   semantics: "outputs/semantics"
@@ -22,7 +22,7 @@ checkpoints: "checkpoints"
 # Semantics
 semantics:
   model_type: "sam2_hiera_large"
-  min_mask_region_area: 100
+  min_mask_region_area: 100 #50
   checkpoint_path: "checkpoints/sam2_hiera_large.pt"
   config_path: "sam2_hiera_l.yaml"
 

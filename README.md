@@ -83,6 +83,9 @@ Powered by `uv` for seamless dependency resolution.
 pip install uv
 uv sync
 
+# For AMD ROCm/HIP acceleration (ROCm 6.1):
+# uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.1
+
 # Run the REST API
 uv run uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
 ```

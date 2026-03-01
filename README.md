@@ -78,8 +78,13 @@ uv run uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
 Powered by `bun` for blazingly fast execution.
 ```bash
 cd frontend
+
 bun install
-bun run dev
+bun run start
+
+# Or you can always use
+npm install
+npm start
 ```
 
 ## Repository Structure

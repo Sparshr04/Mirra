@@ -7,7 +7,7 @@
 [![React](https://img.shields.io/badge/React-20232A?style=flat&logo=react&logoColor=61DAFB)](https://react.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Hackathon Winner](https://img.shields.io/badge/%F0%9F%8F%86-Hackathon%20Winner-gold.svg)]()
+
 
 A state-of-the-art pipeline extracting real-world video into metric-semantic 3D environments using DUSt3R geometry and SAM 2 segmentation.
 
@@ -17,53 +17,37 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
 
 ## Visual Results
 
-<table align="center" width="100%">
+<table align="center">
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom with semantic.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/classroom_with_semantic.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom without semantic vedio.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/classroom_without_semantic_video.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/heatmap_flythrough .mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough_building.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/non_semantic_flythrough .mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="assets/semantic_flythrough_building.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/heatmap_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/heatmap_flythrough_corridor.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough_corridor.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/semantic_flythrough .mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
 </table>

@@ -1,11 +1,17 @@
 """
 src/semantic_engine.py
 ──────────────────────
-SAM 2 Video Segmentation Engine — Maximum Quality Tier.
+SAM 2 Video Segmentation Engine — with MPS Memory Optimization.
 
 Upgraded from frame-0-only auto-masking to multi-keyframe auto-masking.
 New objects that appear after frame 0 (due to camera motion, occlusion
 recovery, or scene content) are now detected and tracked.
+
+Memory Optimizations (M2 MPS):
+  • image_model + mask_generator freed BEFORE video propagation
+  • Periodic MPS cache flush during propagation
+  • Max objects cap (sam2_max_objects) to prevent unbounded tracking memory
+  • Explicit gc.collect() + torch.mps.empty_cache() at stage boundaries
 
 Multi-Keyframe Strategy:
   1. Run SAM2AutomaticMaskGenerator on keyframes at regular intervals
@@ -18,21 +24,31 @@ This ensures full scene coverage regardless of which objects are visible
 in frame 0.
 """
 
+import gc
 import os
 import sys
 import subprocess
-import glob
-import json
-import shutil
-import time
 import torch
 import numpy as np
 import cv2
 import hydra
 from omegaconf import DictConfig
 from tqdm import tqdm
-
+import pathlib
+from hydra.core.global_hydra import GlobalHydra
 from src.video_utils import get_device, find_video, extract_frames
+
+
+# ─── MPS Memory Management ──────────────────────────────────────────
+
+
+def _flush_mps_memory():
+    """Aggressively reclaim MPS unified memory."""
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ─── Dependency Management ───────────────────────────────────────────
@@ -106,6 +122,10 @@ class SemanticEngine:
     The multi-keyframe approach detects and tracks objects that first
     appear at any point in the video, not just frame 0. This is critical
     for camera-motion videos where the scene content changes over time.
+
+    Config Levers:
+      • semantics.keyframe_interval: auto-mask every N-th frame
+      • semantics.max_objects: cap on tracked objects (OOM guard)
     """
 
     def __init__(self, cfg: DictConfig):
@@ -114,7 +134,7 @@ class SemanticEngine:
         print(f"SemanticEngine initialized on device: {self.device}")
 
         self.project_root = (
-            hydra.utils.get_original_cwd()
+            str(pathlib.Path(__file__).resolve().parents[1])
             if hasattr(hydra.utils, "get_original_cwd")
             else os.getcwd()
         )
@@ -133,6 +153,23 @@ class SemanticEngine:
         # Initialize SAM 2 models
         print("Initializing SAM 2 Video Predictor...")
         try:
+            # Tell Hydra exactly where the SAM2 configs live using absolute paths
+            sam2_config_base = os.path.join(
+                self.project_root, "segment-anything-2", "sam2", "configs"
+            )
+
+            # Dynamically find the exact directory containing self.model_cfg
+            sam2_config_dir = sam2_config_base
+            for root, _, files in os.walk(sam2_config_base):
+                if self.model_cfg in files:
+                    sam2_config_dir = root
+                    break
+
+            if not GlobalHydra.instance().is_initialized():
+                hydra.initialize_config_dir(
+                    config_dir=sam2_config_dir, version_base="1.2"
+                )
+
             self.video_predictor = build_sam2_video_predictor(
                 self.model_cfg, self.checkpoint_path, device=self.device
             )
@@ -148,6 +185,10 @@ class SemanticEngine:
         # Multi-keyframe interval (every N-th frame gets auto-masking)
         self.keyframe_interval = cfg.semantics.get("keyframe_interval", 10)
         print(f"  Keyframe interval: every {self.keyframe_interval} frames")
+
+        # Max objects cap (OOM guard)
+        self.max_objects = cfg.semantics.get("max_objects", 30)
+        print(f"  Max objects cap: {self.max_objects}")
 
     def _download_checkpoint(self):
         if not os.path.exists(self.checkpoint_path):
@@ -182,6 +223,21 @@ class SemanticEngine:
             return 0.0
         return float(intersection) / float(union)
 
+    def _free_image_model(self):
+        """Free the image model and mask generator after keyframe detection.
+
+        These are only needed during the keyframe auto-mask phase.
+        Freeing them before propagation reclaims ~1-2GB of MPS memory.
+        """
+        if hasattr(self, "mask_generator") and self.mask_generator is not None:
+            del self.mask_generator
+            self.mask_generator = None
+        if hasattr(self, "image_model") and self.image_model is not None:
+            del self.image_model
+            self.image_model = None
+        _flush_mps_memory()
+        print("  🧹 Image model + mask generator freed (no longer needed)")
+
     def process_video(self, video_path: str):
         """Process video with multi-keyframe auto-masking.
 
@@ -195,106 +251,145 @@ class SemanticEngine:
              d. Propagate forward from this keyframe
           4. Collect all per-frame masks
 
+        Memory Optimization:
+          • image_model freed after all keyframes are processed
+          • Periodic MPS cache flush during propagation
+          • Max objects cap prevents unbounded memory growth
+
         Returns:
             output_masks: dict of {frame_idx: {obj_id: (H, W) bool mask}}
             frames_dir: path to the extracted frames directory
         """
         # 1. Prepare Frames
-        frames, frames_dir = extract_frames(
-            video_path, self.cfg, self.project_root
-        )
+        frames, frames_dir = extract_frames(video_path, self.cfg, self.project_root)
 
-        # 2. Initialize Video State
-        inference_state = self.video_predictor.init_state(video_path=frames_dir)
+        # Automatically match the device type for Mixed Precision
+        if "cuda" in str(self.device):
+            autocast_device = "cuda"
+        elif "mps" in str(self.device):
+            autocast_device = "mps"
+        else:
+            autocast_device = "cpu"
 
-        frame_names = sorted(
-            [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
-        )
-        total_frames = len(frame_names)
-        min_area = self.cfg.semantics.min_mask_region_area
+        # The Official PyTorch/Meta fix: Automatic Mixed Precision (AMP)
+        with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
+            # 2. Initialize Video State
+            inference_state = self.video_predictor.init_state(video_path=frames_dir)
 
-        # ID counter for globally unique object IDs
-        next_obj_id = 1
-        # Track which object IDs currently exist in the propagation state
-        active_obj_ids = set()
-        # IoU threshold for matching existing objects vs new detections
-        IOU_MATCH_THRESHOLD = 0.3
+            frame_names = sorted(
+                [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
+            )
+            total_frames = len(frame_names)
+            min_area = self.cfg.semantics.min_mask_region_area
 
-        # Determine keyframe indices
-        keyframe_indices = list(range(0, total_frames, self.keyframe_interval))
-        # Always include frame 0
-        if 0 not in keyframe_indices:
-            keyframe_indices.insert(0, 0)
+            next_obj_id = 1
+            active_obj_ids = set()
+            IOU_MATCH_THRESHOLD = 0.3
 
-        print(
-            f"\nMulti-keyframe auto-masking: {len(keyframe_indices)} keyframes "
-            f"across {total_frames} frames"
-        )
-        print(f"  Keyframe indices: {keyframe_indices}")
-
-        output_masks = {}
-
-        # 3. Process each keyframe
-        for kf_idx in keyframe_indices:
-            frame_path = os.path.join(frames_dir, frame_names[kf_idx])
-            image = cv2.imread(frame_path)
-            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            keyframe_indices = list(range(0, total_frames, self.keyframe_interval))
+            if 0 not in keyframe_indices:
+                keyframe_indices.insert(0, 0)
 
             print(
-                f"\n[Keyframe {kf_idx}] Running auto-mask generation..."
+                f"\nMulti-keyframe auto-masking: {len(keyframe_indices)} keyframes "
+                f"across {total_frames} frames"
             )
-            new_masks = self._detect_objects_on_frame(image_rgb, min_area)
-            print(f"  Detected {len(new_masks)} objects (area > {min_area})")
+            print(f"  Keyframe indices: {keyframe_indices}")
 
-            # Get current predictions at this frame to check for existing masks
-            # We need to know what's already tracked to avoid duplicate IDs
-            existing_at_kf = {}
-            if kf_idx in output_masks:
-                existing_at_kf = output_masks[kf_idx]
+            output_masks = {}
 
-            new_count = 0
-            for detection in new_masks:
-                det_mask = detection["segmentation"].astype(np.bool_)
+            # 3. Process each keyframe
+            for kf_idx in keyframe_indices:
+                # Check max objects cap (OOM guard)
+                if (next_obj_id - 1) >= self.max_objects:
+                    print(
+                        f"  ⚠️  Max objects cap reached ({self.max_objects}). "
+                        f"Skipping remaining keyframes."
+                    )
+                    break
 
-                # Check IoU against all currently tracked masks at this frame
-                is_novel = True
-                for eid, emask in existing_at_kf.items():
-                    if emask.ndim == 3:
-                        emask = emask[0]
-                    iou = self._compute_iou(det_mask, emask)
-                    if iou > IOU_MATCH_THRESHOLD:
-                        is_novel = False
+                frame_path = os.path.join(frames_dir, frame_names[kf_idx])
+                image = cv2.imread(frame_path)
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+                print(f"\n[Keyframe {kf_idx}] Running auto-mask generation...")
+                new_masks = self._detect_objects_on_frame(image_rgb, min_area)
+                print(f"  Detected {len(new_masks)} objects (area > {min_area})")
+
+                existing_at_kf = {}
+                if kf_idx in output_masks:
+                    existing_at_kf = output_masks[kf_idx]
+
+                new_count = 0
+                for detection in new_masks:
+                    # Enforce max objects cap
+                    if (next_obj_id - 1) >= self.max_objects:
+                        print(
+                            f"  ⚠️  Max objects cap ({self.max_objects}) reached "
+                            f"during keyframe {kf_idx}. Stopping detection."
+                        )
                         break
 
-                if is_novel:
-                    obj_id = next_obj_id
-                    next_obj_id += 1
-                    active_obj_ids.add(obj_id)
+                    det_mask = detection["segmentation"].astype(np.bool_)
 
-                    # Register this new mask into the video predictor
-                    _, out_obj_ids, out_mask_logits = (
-                        self.video_predictor.add_new_mask(
-                            inference_state=inference_state,
-                            frame_idx=kf_idx,
-                            obj_id=obj_id,
-                            mask=det_mask,
+                    is_novel = True
+                    for eid, emask in existing_at_kf.items():
+                        if emask.ndim == 3:
+                            emask = emask[0]
+                        iou = self._compute_iou(det_mask, emask)
+                        if iou > IOU_MATCH_THRESHOLD:
+                            is_novel = False
+                            break
+
+                    if is_novel:
+                        obj_id = next_obj_id
+                        next_obj_id += 1
+                        active_obj_ids.add(obj_id)
+
+                        _, out_obj_ids, out_mask_logits = (
+                            self.video_predictor.add_new_mask(
+                                inference_state=inference_state,
+                                frame_idx=kf_idx,
+                                obj_id=obj_id,
+                                mask=det_mask,
+                            )
                         )
-                    )
-                    new_count += 1
+                        new_count += 1
 
-            print(f"  Registered {new_count} new objects (total: {next_obj_id - 1})")
+                print(
+                    f"  Registered {new_count} new objects (total: {next_obj_id - 1})"
+                )
 
-        # 4. Propagate through entire video
-        print("\nPropagating all masks through video...")
-        for (
-            out_frame_idx,
-            out_obj_ids,
-            out_mask_logits,
-        ) in self.video_predictor.propagate_in_video(inference_state):
-            output_masks[out_frame_idx] = {
-                obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, obj_id in enumerate(out_obj_ids)
-            }
+                # Flush MPS cache after each keyframe's heavy auto-mask work
+                _flush_mps_memory()
+
+            # ─── FREE IMAGE MODEL BEFORE PROPAGATION ─────────────────
+            # The image_model and mask_generator are only needed for
+            # keyframe auto-masking. Free them before the memory-hungry
+            # video propagation phase.
+            self._free_image_model()
+
+            # 4. Propagate through entire video
+            print("\nPropagating all masks through video...")
+            prop_count = 0
+            for (
+                out_frame_idx,
+                out_obj_ids,
+                out_mask_logits,
+            ) in self.video_predictor.propagate_in_video(inference_state):
+                output_masks[out_frame_idx] = {
+                    obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, obj_id in enumerate(out_obj_ids)
+                }
+                prop_count += 1
+
+                # Periodic MPS cache flush during propagation
+                # (every 50 frames to avoid cache buildup)
+                if prop_count % 50 == 0:
+                    _flush_mps_memory()
+
+        # Context manager ends here. Final cleanup.
+        _flush_mps_memory()
 
         total_objects = next_obj_id - 1
         frames_with_masks = len(output_masks)
@@ -307,9 +402,7 @@ class SemanticEngine:
 
     def save_outputs(self, output_masks, frames_dir):
         """Save per-frame masks and debug visualization video."""
-        masks_dir = os.path.join(
-            self.project_root, self.cfg.outputs.semantics, "masks"
-        )
+        masks_dir = os.path.join(self.project_root, self.cfg.outputs.semantics, "masks")
         os.makedirs(masks_dir, exist_ok=True)
 
         print(f"Saving masks to {masks_dir}...")
@@ -324,9 +417,7 @@ class SemanticEngine:
         )
         resolution = self.cfg.resolution
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_vid = cv2.VideoWriter(
-            viz_path, fourcc, 10.0, (resolution, resolution)
-        )
+        out_vid = cv2.VideoWriter(viz_path, fourcc, 10.0, (resolution, resolution))
 
         # Color map
         np.random.seed(42)
@@ -334,12 +425,8 @@ class SemanticEngine:
 
         for frame_idx, frame_name in enumerate(tqdm(frame_names)):
             if frame_idx in output_masks:
-                save_path = os.path.join(
-                    masks_dir, f"frame_{frame_idx:05d}_masks.npz"
-                )
-                masks_str_keys = {
-                    str(k): v for k, v in output_masks[frame_idx].items()
-                }
+                save_path = os.path.join(masks_dir, f"frame_{frame_idx:05d}_masks.npz")
+                masks_str_keys = {str(k): v for k, v in output_masks[frame_idx].items()}
                 np.savez_compressed(save_path, **masks_str_keys)
 
                 # Visualize
@@ -377,10 +464,20 @@ class SemanticEngine:
         out_vid.release()
         print(f"✅ Visualization saved to {viz_path}")
 
+    def unload_all_models(self):
+        """Free all SAM 2 models and reclaim memory.
+
+        Call this after segmentation is fully complete.
+        """
+        for attr in ("mask_generator", "image_model", "video_predictor"):
+            if hasattr(self, attr) and getattr(self, attr) is not None:
+                delattr(self, attr)
+                setattr(self, attr, None)
+        _flush_mps_memory()
+        print("  🧹 All SAM 2 models unloaded, memory freed")
+
 
 # ─── Hydra Cleanup ───────────────────────────────────────────────────
-
-from hydra.core.global_hydra import GlobalHydra
 
 # Clear global hydra instance if it was initialized by imports (SAM 2)
 GlobalHydra.instance().clear()
@@ -388,6 +485,10 @@ GlobalHydra.instance().clear()
 
 @hydra.main(version_base=None, config_path="../", config_name="config")
 def main(cfg: DictConfig):
+    from src.config_presets import apply_preset
+
+    cfg = apply_preset(cfg)
+
     engine = SemanticEngine(cfg)
 
     video_path = find_video(cfg, engine.project_root)
@@ -395,6 +496,7 @@ def main(cfg: DictConfig):
 
     output_masks, frames_dir = engine.process_video(video_path)
     engine.save_outputs(output_masks, frames_dir)
+    engine.unload_all_models()
 
 
 if __name__ == "__main__":

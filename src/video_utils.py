@@ -5,16 +5,22 @@ Shared utilities for the Mirra reconstruction pipeline.
 
 Consolidates duplicated logic from GeometryEngine and SemanticEngine:
   • Device detection (CUDA / ROCm / MPS / CPU)
-  • Video file discovery from dataset config
+  • Video file discovery from dataset config (robust, newest-first)
   • Frame extraction with metadata-based cache validation
+
+Drop-and-Run UX:
+  • Auto-detects the NEWEST video in data/raw/
+  • Handles filenames with spaces, special characters, and Unicode
+  • Case-insensitive extension matching (.mp4, .MP4, .MOV, etc.)
+  • Clear diagnostics when no files are found or multiple exist
 """
 
 import os
 import sys
-import glob
 import json
 import shutil
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -40,46 +46,95 @@ def get_device(cfg: DictConfig) -> str:
                 "AMD ROCm / HIP detected. Utilizing AMD Instinct/Radeon acceleration."
             )
         return "cuda"
-    elif torch.backends.mps.is_available() and cfg.device == "mps":
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     else:
         return "cpu"
 
 
-# ─── Video Discovery ─────────────────────────────────────────────────
+# ─── Video Discovery (Drop-and-Run UX) ──────────────────────────────
+
+# Supported video extensions (case-insensitive)
+_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 
 def find_video(cfg: DictConfig, project_root: str) -> str:
     """Locate the input video using the unified dataset config.
 
-    Checks for a specific ``video_filename`` first, then falls back
-    to auto-detecting the first video file in ``raw_video_dir``.
+    Drop-and-Run UX:
+      1. If a specific ``video_filename`` is configured, use it.
+      2. Otherwise, auto-detect the NEWEST video file in ``raw_video_dir``
+         (sorted by modification time, not alphabetically).
+      3. Handles spaces, special characters, and Unicode filenames.
+      4. Case-insensitive extension matching (supports .MP4, .MOV, etc.)
 
     Raises:
-        FileNotFoundError: if no video can be found.
+        FileNotFoundError: if no video can be found, with a helpful message.
     """
-    raw_dir = os.path.join(project_root, cfg.dataset.raw_video_dir)
-    if not os.path.exists(raw_dir):
-        raise FileNotFoundError(f"Raw video directory not found: {raw_dir}")
+    raw_dir = Path(project_root) / cfg.dataset.raw_video_dir
+
+    if not raw_dir.exists():
+        raise FileNotFoundError(
+            f"❌ Raw video directory not found: {raw_dir}\n"
+            f"   Create it with: mkdir -p {raw_dir}"
+        )
 
     # Check for a specific filename first
     video_filename = cfg.dataset.get("video_filename", "")
     if video_filename:
-        video_path = os.path.join(raw_dir, video_filename)
-        if os.path.exists(video_path):
-            return video_path
+        video_path = raw_dir / video_filename
+        if video_path.exists():
+            print(f"📹 Using configured video: {video_path.name}")
+            return str(video_path)
         print(
-            f"Warning: Specified video '{video_filename}' not found, auto-detecting..."
+            f"⚠️  Specified video '{video_filename}' not found in {raw_dir}. "
+            f"Auto-detecting..."
         )
 
-    # Auto-detect first video file
-    patterns = ["*.mp4", "*.mov", "*.avi", "*.mkv"]
-    for pattern in patterns:
-        matches = sorted(glob.glob(os.path.join(raw_dir, pattern)))
-        if matches:
-            return matches[0]
+    # Auto-detect: find ALL video files with case-insensitive extension matching
+    video_files = []
+    for item in raw_dir.iterdir():
+        if item.is_file() and item.suffix.lower() in _VIDEO_EXTENSIONS:
+            video_files.append(item)
 
-    raise FileNotFoundError(f"No video files found in {raw_dir}")
+    if not video_files:
+        # Provide a helpful diagnostic
+        all_files = list(raw_dir.iterdir())
+        if not all_files:
+            raise FileNotFoundError(
+                f"❌ No files found in {raw_dir}\n"
+                f"   Drop a .mp4 or .mov video into this folder and re-run."
+            )
+        else:
+            file_list = ", ".join(f.name for f in all_files[:5])
+            raise FileNotFoundError(
+                f"❌ No video files found in {raw_dir}\n"
+                f"   Found {len(all_files)} file(s): {file_list}\n"
+                f"   Supported formats: {', '.join(sorted(_VIDEO_EXTENSIONS))}"
+            )
+
+    # Sort by modification time (newest first)
+    video_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    selected = video_files[0]
+
+    if len(video_files) > 1:
+        print(
+            f"📹 Found {len(video_files)} videos in {raw_dir.name}/. "
+            f"Auto-selected newest:"
+        )
+        for i, vf in enumerate(video_files[:5]):
+            marker = "  → " if i == 0 else "    "
+            mtime = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(vf.stat().st_mtime)
+            )
+            print(f"{marker}{vf.name}  (modified: {mtime})")
+        if len(video_files) > 5:
+            print(f"    ... and {len(video_files) - 5} more")
+    else:
+        print(f"📹 Auto-detected video: {selected.name}")
+
+    return str(selected)
 
 
 # ─── Frame Cache Validation ──────────────────────────────────────────

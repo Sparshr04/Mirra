@@ -1,7 +1,7 @@
 [project]
-name = "anything"
-version = "0.1.0"
-description = "Add your description here"
+name = "mirra"
+version = "0.2.0"
+description = "Reality-to-Simulation via 3D Semantic Reconstruction (VGGT + SAM 2 + TSDF)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -25,4 +25,13 @@ dependencies = [
     "tqdm>=4.65.0",
     "trimesh>=4.11.2",
     "uvicorn>=0.41.0",
+]
+
+[project.optional-dependencies]
+# VGGT is installed via 'git clone + pip install -e .' from its repo.
+# SAM 2 is installed via 'git clone + pip install -e .' from its repo.
+# These are documented here but managed by the engine setup functions.
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
 ]

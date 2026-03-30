@@ -1,3 +1,23 @@
+"""
+src/semantic_engine.py
+──────────────────────
+SAM 2 Video Segmentation Engine — Maximum Quality Tier.
+
+Upgraded from frame-0-only auto-masking to multi-keyframe auto-masking.
+New objects that appear after frame 0 (due to camera motion, occlusion
+recovery, or scene content) are now detected and tracked.
+
+Multi-Keyframe Strategy:
+  1. Run SAM2AutomaticMaskGenerator on keyframes at regular intervals
+     (configurable via semantics.keyframe_interval, default every 10 frames)
+  2. Merge newly detected objects into the video propagation state
+  3. Continue propagation forward from each keyframe
+  4. Final output: per-frame masks with consistent object IDs
+
+This ensures full scene coverage regardless of which objects are visible
+in frame 0.
+"""
+
 import os
 import sys
 import subprocess
@@ -5,7 +25,6 @@ import glob
 import json
 import shutil
 import time
-import pathlib
 import torch
 import numpy as np
 import cv2
@@ -13,14 +32,14 @@ import hydra
 from omegaconf import DictConfig
 from tqdm import tqdm
 
+from src.video_utils import get_device, find_video, extract_frames
 
-# --- Dependency Management ---
+
+# ─── Dependency Management ───────────────────────────────────────────
+
+
 def setup_sam2():
-    """
-    Checks for 'segment-anything-2' directory. If not found, clones it.
-    Installs it in editable mode with SAM2_BUILD_CUDA=0 for Mac.
-    Adds it to sys.path.
-    """
+    """Ensure SAM 2 is cloned and installed."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
     sam2_path = os.path.join(project_root, "segment-anything-2")
@@ -52,7 +71,10 @@ def setup_sam2():
             env = os.environ.copy()
             env["SAM2_BUILD_CUDA"] = "0"
             subprocess.run(
-                ["uv", "pip", "install", "-e", "."], cwd=sam2_path, env=env, check=True
+                [sys.executable, "-m", "pip", "install", "-e", "."],
+                cwd=sam2_path,
+                env=env,
+                check=True,
             )
             print("SAM 2 installed successfully.")
         except subprocess.CalledProcessError as e:
@@ -74,23 +96,33 @@ except ImportError as e:
     print(f"Critical Import Error: {e}")
     sys.exit(1)
 
-# --- Main Engine ---
+
+# ─── Main Engine ─────────────────────────────────────────────────────
 
 
 class SemanticEngine:
+    """SAM 2 segmentation engine with multi-keyframe auto-masking.
+
+    The multi-keyframe approach detects and tracks objects that first
+    appear at any point in the video, not just frame 0. This is critical
+    for camera-motion videos where the scene content changes over time.
+    """
+
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
-        self.device = self._get_device()
+        self.device = get_device(cfg)
         print(f"SemanticEngine initialized on device: {self.device}")
 
-        # Resolve project root from this file's location (src/ -> parent)
-        # Works in both Hydra CLI mode and FastAPI background tasks
-        self.project_root = str(pathlib.Path(__file__).resolve().parents[1])
+        self.project_root = (
+            hydra.utils.get_original_cwd()
+            if hasattr(hydra.utils, "get_original_cwd")
+            else os.getcwd()
+        )
         self.checkpoints_dir = os.path.join(self.project_root, "checkpoints")
         os.makedirs(self.checkpoints_dir, exist_ok=True)
 
         # Model Paths
-        self.model_cfg = cfg.semantics.config_path  # "sam2_hiera_l.yaml"
+        self.model_cfg = cfg.semantics.config_path
         self.checkpoint_path = os.path.join(
             self.checkpoints_dir, os.path.basename(cfg.semantics.checkpoint_path)
         )
@@ -98,31 +130,24 @@ class SemanticEngine:
         # Download Checkpoint if missing
         self._download_checkpoint()
 
-        # Initialize Video Predictor
+        # Initialize SAM 2 models
         print("Initializing SAM 2 Video Predictor...")
         try:
             self.video_predictor = build_sam2_video_predictor(
                 self.model_cfg, self.checkpoint_path, device=self.device
             )
-
-            # Initialize Image Model for Automatic Mask Generation (on frame 0)
             self.image_model = build_sam2(
                 self.model_cfg, self.checkpoint_path, device=self.device
             )
             self.mask_generator = SAM2AutomaticMaskGenerator(self.image_model)
-
             print("SAM 2 Models loaded successfully.")
         except Exception as e:
             print(f"Error loading SAM 2 models: {e}")
             raise e
 
-    def _get_device(self):
-        if torch.backends.mps.is_available() and self.cfg.device == "mps":
-            return "mps"
-        elif torch.cuda.is_available() and self.cfg.device == "cuda":
-            return "cuda"
-        else:
-            return "cpu"
+        # Multi-keyframe interval (every N-th frame gets auto-masking)
+        self.keyframe_interval = cfg.semantics.get("keyframe_interval", 10)
+        print(f"  Keyframe interval: every {self.keyframe_interval} frames")
 
     def _download_checkpoint(self):
         if not os.path.exists(self.checkpoint_path):
@@ -135,208 +160,132 @@ class SemanticEngine:
                 print(f"Failed to download checkpoint: {e}")
                 sys.exit(1)
 
-    def _find_video(self):
+    def _detect_objects_on_frame(
+        self, frame_rgb: np.ndarray, min_area: int
+    ) -> list[dict]:
+        """Run SAM2AutomaticMaskGenerator on a single frame.
+
+        Returns filtered masks sorted by area (largest first).
         """
-        Locate the input video using the unified dataset config.
-        Uses glob to auto-detect the first video if no specific filename is set.
+        masks = self.mask_generator.generate(frame_rgb)
+        # Filter by minimum area
+        masks = [m for m in masks if m["area"] > min_area]
+        # Sort by area descending (largest objects first for ID stability)
+        masks.sort(key=lambda m: m["area"], reverse=True)
+        return masks
+
+    def _compute_iou(self, mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+        """Compute Intersection-over-Union between two boolean masks."""
+        intersection = np.logical_and(mask_a, mask_b).sum()
+        union = np.logical_or(mask_a, mask_b).sum()
+        if union == 0:
+            return 0.0
+        return float(intersection) / float(union)
+
+    def process_video(self, video_path: str):
+        """Process video with multi-keyframe auto-masking.
+
+        Strategy:
+          1. Extract frames to disk (required by SAM 2 video predictor)
+          2. Initialize video tracking state
+          3. For each keyframe:
+             a. Run automatic mask generation
+             b. Match new detections against existing tracked objects (IoU)
+             c. Register genuinely new objects into the tracker
+             d. Propagate forward from this keyframe
+          4. Collect all per-frame masks
+
+        Returns:
+            output_masks: dict of {frame_idx: {obj_id: (H, W) bool mask}}
+            frames_dir: path to the extracted frames directory
         """
-        raw_dir = os.path.join(self.project_root, self.cfg.dataset.raw_video_dir)
-        if not os.path.exists(raw_dir):
-            raise FileNotFoundError(f"Raw video directory not found: {raw_dir}")
-
-        # Check for a specific filename first
-        video_filename = self.cfg.dataset.get("video_filename", "")
-        if video_filename:
-            video_path = os.path.join(raw_dir, video_filename)
-            if os.path.exists(video_path):
-                return video_path
-            print(
-                f"Warning: Specified video '{video_filename}' not found, auto-detecting..."
-            )
-
-        # Auto-detect first video file
-        patterns = ["*.mp4", "*.mov", "*.avi", "*.mkv"]
-        for pattern in patterns:
-            matches = sorted(glob.glob(os.path.join(raw_dir, pattern)))
-            if matches:
-                return matches[0]
-
-        raise FileNotFoundError(f"No video files found in {raw_dir}")
-
-    def _validate_frame_cache(self, frames_dir, video_path):
-        """
-        Check if the cached frames match the current video.
-        Returns True if cache is valid, False otherwise.
-        """
-        force = self.cfg.dataset.get("force_reprocess", False)
-        if force:
-            print("force_reprocess is enabled. Clearing frame cache...")
-            return False
-
-        metadata_path = os.path.join(frames_dir, "metadata.json")
-        if not os.path.exists(metadata_path):
-            return False
-
-        try:
-            with open(metadata_path, "r") as f:
-                metadata = json.load(f)
-
-            stored_name = metadata.get("source_video_name", "")
-            current_name = os.path.basename(video_path)
-
-            if stored_name != current_name:
-                print(
-                    f"Detected new video input: '{current_name}' "
-                    f"(cached: '{stored_name}'). Clearing old cache..."
-                )
-                return False
-
-            if metadata.get("stride") != self.cfg.stride:
-                print(
-                    f"Stride changed ({metadata.get('stride')} → {self.cfg.stride}). "
-                    f"Clearing old cache..."
-                )
-                return False
-            if metadata.get("resolution") != self.cfg.resolution:
-                print(
-                    f"Resolution changed ({metadata.get('resolution')} → {self.cfg.resolution}). "
-                    f"Clearing old cache..."
-                )
-                return False
-
-            return True
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"Corrupt metadata.json ({e}). Clearing cache...")
-            return False
-
-    def _save_frame_metadata(self, frames_dir, video_path, num_frames):
-        """Write metadata.json to track which video produced these frames."""
-        metadata = {
-            "source_video_name": os.path.basename(video_path),
-            "timestamp": time.time(),
-            "num_frames": num_frames,
-            "stride": self.cfg.stride,
-            "resolution": self.cfg.resolution,
-        }
-        metadata_path = os.path.join(frames_dir, "metadata.json")
-        with open(metadata_path, "w") as f:
-            json.dump(metadata, f, indent=2)
-        print(f"Saved frame metadata to {metadata_path}")
-
-    def _clear_frame_cache(self, frames_dir):
-        """Remove all files in the frames directory."""
-        if os.path.exists(frames_dir):
-            shutil.rmtree(frames_dir)
-        os.makedirs(frames_dir, exist_ok=True)
-
-    def extract_frames(self, video_path):
-        """
-        Extracts frames to disk (required for SAM 2 video predictor).
-        Uses the shared processed_frames_dir from the dataset config.
-        Implements stale data detection via metadata.json.
-        """
-        frames_dir = os.path.join(
-            self.project_root, self.cfg.dataset.processed_frames_dir
-        )
-        os.makedirs(frames_dir, exist_ok=True)
-
-        # --- Stale data detection ---
-        existing = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
-        if existing and self._validate_frame_cache(frames_dir, video_path):
-            print(
-                f"Found {len(existing)} cached frames matching '{os.path.basename(video_path)}'. "
-                f"Skipping extraction."
-            )
-            return frames_dir
-
-        # Cache invalid or empty → clear and re-extract
-        if existing:
-            self._clear_frame_cache(frames_dir)
-
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video not found at {video_path}")
-
-        # --- Fresh extraction ---
-        stride = self.cfg.stride
-        resolution = self.cfg.resolution
-        print(f"Extracting frames to {frames_dir}...")
-
-        cap = cv2.VideoCapture(video_path)
-        frame_idx = 0
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame_idx % stride == 0:
-                frame = cv2.resize(frame, (resolution, resolution))
-                save_idx = frame_idx // stride
-                save_path = os.path.join(frames_dir, f"{save_idx:05d}.jpg")
-                cv2.imwrite(save_path, frame)
-
-            frame_idx += 1
-
-        cap.release()
-        extracted = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
-        print(f"Frame extraction complete. {extracted} frames saved to {frames_dir}.")
-
-        # Write metadata for future cache validation
-        self._save_frame_metadata(frames_dir, video_path, extracted)
-        return frames_dir
-
-    def process_video(self, video_path):
         # 1. Prepare Frames
-        frames_dir = self.extract_frames(video_path)
+        frames, frames_dir = extract_frames(
+            video_path, self.cfg, self.project_root
+        )
 
         # 2. Initialize Video State
         inference_state = self.video_predictor.init_state(video_path=frames_dir)
 
-        # 3. Auto-Prompt Frame 0
-        print("Generating automatic masks for Frame 0...")
         frame_names = sorted(
             [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
         )
-        frame0_path = os.path.join(frames_dir, frame_names[0])
-        image0 = cv2.imread(frame0_path)
-        image0 = cv2.cvtColor(image0, cv2.COLOR_BGR2RGB)
-
-        masks0 = self.mask_generator.generate(image0)
-        print(f"Found {len(masks0)} objects in Frame 0.")
-
-        # Filter tiny masks
+        total_frames = len(frame_names)
         min_area = self.cfg.semantics.min_mask_region_area
-        masks0 = [m for m in masks0 if m["area"] > min_area]
-        print(f"Kept {len(masks0)} objects after filtering (area > {min_area}).")
+
+        # ID counter for globally unique object IDs
+        next_obj_id = 1
+        # Track which object IDs currently exist in the propagation state
+        active_obj_ids = set()
+        # IoU threshold for matching existing objects vs new detections
+        IOU_MATCH_THRESHOLD = 0.3
+
+        # Determine keyframe indices
+        keyframe_indices = list(range(0, total_frames, self.keyframe_interval))
+        # Always include frame 0
+        if 0 not in keyframe_indices:
+            keyframe_indices.insert(0, 0)
+
+        print(
+            f"\nMulti-keyframe auto-masking: {len(keyframe_indices)} keyframes "
+            f"across {total_frames} frames"
+        )
+        print(f"  Keyframe indices: {keyframe_indices}")
 
         output_masks = {}
 
-        # 4. Add Prompts to Video Predictor
-        final_out_obj_ids = []
-        final_out_mask_logits = []
+        # 3. Process each keyframe
+        for kf_idx in keyframe_indices:
+            frame_path = os.path.join(frames_dir, frame_names[kf_idx])
+            image = cv2.imread(frame_path)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        for i, mask_data in enumerate(masks0):
-            mask = mask_data["segmentation"].astype(np.bool_)
-            obj_id = i + 1
-
-            _, final_out_obj_ids, final_out_mask_logits = (
-                self.video_predictor.add_new_mask(
-                    inference_state=inference_state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    mask=mask,
-                )
+            print(
+                f"\n[Keyframe {kf_idx}] Running auto-mask generation..."
             )
+            new_masks = self._detect_objects_on_frame(image_rgb, min_area)
+            print(f"  Detected {len(new_masks)} objects (area > {min_area})")
 
-        # Save Frame 0 results
-        if len(masks0) > 0:
-            output_masks[0] = {
-                obj_id: (final_out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, obj_id in enumerate(final_out_obj_ids)
-            }
+            # Get current predictions at this frame to check for existing masks
+            # We need to know what's already tracked to avoid duplicate IDs
+            existing_at_kf = {}
+            if kf_idx in output_masks:
+                existing_at_kf = output_masks[kf_idx]
 
-        # 5. Propagate
-        print("Propagating masks through video...")
+            new_count = 0
+            for detection in new_masks:
+                det_mask = detection["segmentation"].astype(np.bool_)
+
+                # Check IoU against all currently tracked masks at this frame
+                is_novel = True
+                for eid, emask in existing_at_kf.items():
+                    if emask.ndim == 3:
+                        emask = emask[0]
+                    iou = self._compute_iou(det_mask, emask)
+                    if iou > IOU_MATCH_THRESHOLD:
+                        is_novel = False
+                        break
+
+                if is_novel:
+                    obj_id = next_obj_id
+                    next_obj_id += 1
+                    active_obj_ids.add(obj_id)
+
+                    # Register this new mask into the video predictor
+                    _, out_obj_ids, out_mask_logits = (
+                        self.video_predictor.add_new_mask(
+                            inference_state=inference_state,
+                            frame_idx=kf_idx,
+                            obj_id=obj_id,
+                            mask=det_mask,
+                        )
+                    )
+                    new_count += 1
+
+            print(f"  Registered {new_count} new objects (total: {next_obj_id - 1})")
+
+        # 4. Propagate through entire video
+        print("\nPropagating all masks through video...")
         for (
             out_frame_idx,
             out_obj_ids,
@@ -347,10 +296,20 @@ class SemanticEngine:
                 for i, obj_id in enumerate(out_obj_ids)
             }
 
+        total_objects = next_obj_id - 1
+        frames_with_masks = len(output_masks)
+        print(
+            f"\n✅ Segmentation complete: {total_objects} objects "
+            f"tracked across {frames_with_masks} frames"
+        )
+
         return output_masks, frames_dir
 
     def save_outputs(self, output_masks, frames_dir):
-        masks_dir = os.path.join(self.project_root, self.cfg.outputs.semantics, "masks")
+        """Save per-frame masks and debug visualization video."""
+        masks_dir = os.path.join(
+            self.project_root, self.cfg.outputs.semantics, "masks"
+        )
         os.makedirs(masks_dir, exist_ok=True)
 
         print(f"Saving masks to {masks_dir}...")
@@ -359,35 +318,38 @@ class SemanticEngine:
             [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
         )
 
-        # For visualization
+        # Visualization video
         viz_path = os.path.join(
             self.project_root, self.cfg.outputs.semantics, "debug_tracking.mp4"
         )
         resolution = self.cfg.resolution
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out_vid = cv2.VideoWriter(viz_path, fourcc, 10.0, (resolution, resolution))
+        out_vid = cv2.VideoWriter(
+            viz_path, fourcc, 10.0, (resolution, resolution)
+        )
 
-        # Color map for objects
+        # Color map
         np.random.seed(42)
         colors = np.random.randint(0, 255, (1000, 3), dtype=np.uint8)
 
         for frame_idx, frame_name in enumerate(tqdm(frame_names)):
-            # 1. Save NPZ
             if frame_idx in output_masks:
-                save_path = os.path.join(masks_dir, f"frame_{frame_idx:05d}_masks.npz")
-                # keys must be strings for kwargs unpacking
-                masks_str_keys = {str(k): v for k, v in output_masks[frame_idx].items()}
+                save_path = os.path.join(
+                    masks_dir, f"frame_{frame_idx:05d}_masks.npz"
+                )
+                masks_str_keys = {
+                    str(k): v for k, v in output_masks[frame_idx].items()
+                }
                 np.savez_compressed(save_path, **masks_str_keys)
 
-                # 2. Visualize
+                # Visualize
                 img_path = os.path.join(frames_dir, frame_name)
                 frame = cv2.imread(img_path)
 
                 overlay = frame.copy()
                 alpha = 0.5
 
-                start_masks = output_masks[frame_idx]
-                for obj_id, mask in start_masks.items():
+                for obj_id, mask in output_masks[frame_idx].items():
                     if mask.ndim == 3:
                         mask = mask[0]
 
@@ -397,9 +359,13 @@ class SemanticEngine:
 
                     mask_bool = mask > 0
                     if not mask_bool.any():
-                        continue  # skip empty masks
+                        continue
                     overlay[mask_bool] = cv2.addWeighted(
-                        overlay[mask_bool], 1 - alpha, colored_mask[mask_bool], alpha, 0
+                        overlay[mask_bool],
+                        1 - alpha,
+                        colored_mask[mask_bool],
+                        alpha,
+                        0,
                     )
 
                 out_vid.write(overlay)
@@ -412,6 +378,8 @@ class SemanticEngine:
         print(f"✅ Visualization saved to {viz_path}")
 
 
+# ─── Hydra Cleanup ───────────────────────────────────────────────────
+
 from hydra.core.global_hydra import GlobalHydra
 
 # Clear global hydra instance if it was initialized by imports (SAM 2)
@@ -422,8 +390,7 @@ GlobalHydra.instance().clear()
 def main(cfg: DictConfig):
     engine = SemanticEngine(cfg)
 
-    # Locate video using unified dataset config
-    video_path = engine._find_video()
+    video_path = find_video(cfg, engine.project_root)
     print(f"Processing video: {video_path}")
 
     output_masks, frames_dir = engine.process_video(video_path)

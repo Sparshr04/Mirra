@@ -2,15 +2,15 @@
 """
 Main orchestration script for the Mirra Semantic 3D Reconstruction Pipeline.
 
-Architecture: Maximum Quality Tier
-───────────────────────────────────
-Runs the pipeline with PARALLEL execution of independent stages:
+Architecture: Preset-Driven (draft / default / high_quality)
+───────────────────────────────────────────────────────────────
+Runs the pipeline with configurable execution modes:
 
   ┌─ Frame Extraction (shared) ─┐
   │                              │
-  ├─→ GeometryEngineV2 (VGGT) ──┤  ← runs concurrently
+  ├─→ GeometryEngineV2 (VGGT) ──┤  ← runs concurrently (if parallel_stages)
   │                              │
-  ├─→ SemanticEngine (SAM 2) ───┤  ← runs concurrently
+  ├─→ SemanticEngine (SAM 2) ───┤  ← runs concurrently (if parallel_stages)
   │                              │
   └──────────────┬───────────────┘
                  │
@@ -22,27 +22,52 @@ Runs the pipeline with PARALLEL execution of independent stages:
        semantic_mesh.ply
        3dgs_init.npz
 
-Key optimization: Geometry (VGGT) and Semantics (SAM 2) only share the
-extracted frames — they have no data dependency on each other. Running
-them in parallel via ProcessPoolExecutor halves the wall-clock time.
+Memory Optimization (MPS / Apple Silicon):
+  • _flush_mps_memory() called at every stage boundary
+  • Models explicitly unloaded after inference
+  • Serial mode (default) runs one model at a time
+  • Parallel mode only for ≥16GB unified memory
 
-After both complete, the FusionEngine TSDF stage integrates the depth
-maps with the semantic masks to produce the final outputs.
+Config Presets:
+  uv run python main.py                        # 'default' preset
+  uv run python main.py preset=draft           # fast mode (~60s)
+  uv run python main.py preset=high_quality    # max quality
+  uv run python main.py preset=draft stride=50 # override levers
 """
 
+import gc
 import os
 import sys
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import torch
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from src.video_utils import find_video, extract_frames
+from src.config_presets import apply_preset
+
+
+# ─── MPS Memory Management ──────────────────────────────────────────
+
+
+def _flush_mps_memory():
+    """Aggressively reclaim MPS unified memory.
+
+    On Apple Silicon, GPU and CPU share the same physical RAM.
+    We must explicitly flush the MPS allocator cache AND trigger
+    Python garbage collection to actually reclaim memory.
+    """
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ─── Stage Workers (run in separate processes) ──────────────────────
@@ -59,9 +84,11 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
     Returns:
         Status message string
     """
+    import gc
+    import torch
     from omegaconf import OmegaConf
     from src.geometry_engine_v2 import GeometryEngineV2
-    from src.video_utils import extract_frames
+    from src.video_utils import extract_frames, get_device
 
     cfg = OmegaConf.create(cfg_dict)
 
@@ -71,18 +98,19 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
     engine.project_root = project_root
 
     # Re-initialize manually (bypass Hydra in subprocess)
-    import torch
-    from src.video_utils import get_device
-
     engine.device = get_device(cfg)
-    engine.dtype = torch.float32
+
+    # Apply precision from config
+    precision = cfg.get("vggt_precision", "float32")
+    engine.dtype = torch.bfloat16 if precision == "bfloat16" else torch.float32
+    engine.vggt_resolution = cfg.get("vggt_resolution", 518)
 
     # Load VGGT model
     print("[Geometry Worker] Loading VGGT-1B model...")
     from vggt.models.vggt import VGGT
 
     engine.model = VGGT.from_pretrained("facebook/VGGT-1B")
-    engine.model = engine.model.to(engine.device).eval()
+    engine.model = engine.model.to(device=engine.device, dtype=engine.dtype).eval()
 
     engine.geo_dir = os.path.join(project_root, "outputs", "geometry")
     engine.depth_dir = os.path.join(engine.geo_dir, "depth")
@@ -96,6 +124,13 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
 
     result = engine.run_inference(frames)
     engine.save_outputs(result, frames)
+
+    # ─── MEMORY CLEANUP ─────────────────────────────────────────
+    engine.unload_model()
+    del engine, result, frames
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
     return "SUCCESS"
 
@@ -111,6 +146,8 @@ def _run_semantics(cfg_dict: dict, video_path: str, project_root: str) -> str:
     Returns:
         Status message string
     """
+    import gc
+    import torch
     from omegaconf import OmegaConf
     from src.semantic_engine import SemanticEngine
 
@@ -122,6 +159,13 @@ def _run_semantics(cfg_dict: dict, video_path: str, project_root: str) -> str:
 
     output_masks, frames_dir = engine.process_video(video_path)
     engine.save_outputs(output_masks, frames_dir)
+
+    # ─── MEMORY CLEANUP ─────────────────────────────────────────
+    engine.unload_all_models()
+    del engine, output_masks
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
     return "SUCCESS"
 
@@ -136,9 +180,13 @@ def main(cfg: DictConfig):
     Stages 1 and 2 are executed in parallel when possible.
     Stage 3 (fusion) waits for both to complete.
     """
+    # ─── APPLY PRESET PROFILE ────────────────────────────────────
+    cfg = apply_preset(cfg)
+
     print("=" * 70)
     print("MIRRA — SEMANTIC 3D RECONSTRUCTION PIPELINE")
-    print("Architecture: Maximum Quality Tier (VGGT + SAM 2 + TSDF)")
+    preset = cfg.get("preset", "default")
+    print(f"Mode: {preset.upper()} (VGGT + SAM 2 + TSDF)")
     print("=" * 70)
 
     project_root = (
@@ -164,13 +212,13 @@ def main(cfg: DictConfig):
         sys.exit(1)
 
     # ─── STAGE 1 + 2: PARALLEL GEOMETRY + SEMANTICS ─────────────────
-    parallel = cfg.get("parallel_stages", True)
+    parallel = cfg.get("parallel_stages", False)
 
     if parallel:
         print("\n[1+2/3] Running Geometry + Semantics in PARALLEL...")
+        print("  ⚠️  Requires ~8GB+ unified memory (both models loaded)")
 
         # Convert cfg to a plain dict for pickling across processes
-        from omegaconf import OmegaConf
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
 
         geo_status = None
@@ -208,7 +256,7 @@ def main(cfg: DictConfig):
             sys.exit(1)
 
     else:
-        # Serial fallback (for debugging or single-GPU systems)
+        # Serial mode (default) — runs one model at a time to save memory
         print("\n[1/3] Running Geometry Engine (VGGT)...")
         try:
             from src.geometry_engine_v2 import GeometryEngineV2
@@ -216,14 +264,13 @@ def main(cfg: DictConfig):
             geo_engine = GeometryEngineV2(cfg)
             result = geo_engine.run_inference(frames)
             geo_engine.save_outputs(result, frames)
-            print("✅ Geometry stage complete.")
 
-            # Free GPU memory before loading SAM 2
-            del geo_engine.model
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            print("  (Model unloaded, GPU memory freed)")
+            # ─── FREE VGGT MODEL BEFORE LOADING SAM 2 ───────────
+            geo_engine.unload_model()
+            del geo_engine, result
+            _flush_mps_memory()
+            print("  🧹 VGGT fully unloaded, memory freed for SAM 2")
+
         except Exception as e:
             print(f"❌ Geometry stage failed: {e}")
             traceback.print_exc()
@@ -236,14 +283,13 @@ def main(cfg: DictConfig):
             sem_engine = SemanticEngine(cfg)
             output_masks, frames_dir = sem_engine.process_video(video_path)
             sem_engine.save_outputs(output_masks, frames_dir)
-            print("✅ Semantics stage complete.")
 
-            # Free GPU memory
-            del sem_engine.video_predictor
-            del sem_engine.image_model
-            del sem_engine.mask_generator
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # ─── FREE SAM 2 MODELS BEFORE FUSION ────────────────
+            sem_engine.unload_all_models()
+            del sem_engine, output_masks
+            _flush_mps_memory()
+            print("  🧹 SAM 2 fully unloaded, memory freed for TSDF")
+
         except Exception as e:
             print(f"❌ Semantics stage failed: {e}")
             traceback.print_exc()
@@ -257,6 +303,11 @@ def main(cfg: DictConfig):
         fusion_engine = FusionEngine(cfg)
         fusion_engine.run()
         print("✅ Fusion stage complete.")
+
+        # Final cleanup
+        del fusion_engine
+        _flush_mps_memory()
+
     except Exception as e:
         print(f"❌ Fusion stage failed: {e}")
         traceback.print_exc()
@@ -267,7 +318,7 @@ def main(cfg: DictConfig):
     final_dir = os.path.join(project_root, "outputs", "final")
 
     print("\n" + "=" * 70)
-    print(f"PIPELINE COMPLETE — {elapsed:.1f}s total")
+    print(f"PIPELINE COMPLETE — {elapsed:.1f}s total ({preset} mode)")
     print("=" * 70)
     print("\nOutputs:")
     print(f"  • Semantic Point Cloud: {final_dir}/semantic_world.ply")

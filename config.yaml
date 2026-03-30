@@ -1,11 +1,19 @@
-# Configuration for Semantic World Reconstruction Pipeline
+# Configuration for Mirra — Semantic 3D Reconstruction Pipeline
+# Architecture: Maximum Quality Tier (VGGT + SAM 2 + TSDF)
 
 # Hardware / Compute
-device: "mps"  # Metal Performance Shaders for Apple Silicon
+device: "cuda" #cuda/cpu/mps
 
 # Reconstruction Parameters
-resolution: 256 #512
+resolution: 512
 stride: 45
+
+# Geometry Backend
+geometry_backend: "vggt"    # "vggt" (recommended) or "dust3r" (legacy)
+
+# Pipeline Execution
+parallel_stages: true       # Run geometry + semantics concurrently
+enable_denoiser: true       # Statistical + radius outlier removal
 
 # Paths
 data:
@@ -19,22 +27,29 @@ outputs:
 
 checkpoints: "checkpoints"
 
-# Semantics
+# Semantics (SAM 2)
 semantics:
   model_type: "sam2_hiera_large"
   min_mask_region_area: 100
   checkpoint_path: "checkpoints/sam2_hiera_large.pt"
   config_path: "sam2_hiera_l.yaml"
+  keyframe_interval: 10     # Auto-mask every N-th frame (multi-keyframe)
 
 depth_model:
-  type: "midas" # Example
+  type: "vggt"  # Metric depth from VGGT (replaces MiDaS)
 
 # Unified Dataset Paths (single source of truth for both engines)
 dataset:
   raw_video_dir: "data/raw"
   processed_frames_dir: "data/processed/frames"
   video_filename: ""  # Leave empty to auto-detect first video in raw_video_dir
-  force_reprocess: false  # Set to true to always re-extract frames
+  force_reprocess: false
 
 # Geometry Engine Checkpointing
-resume: true  # Enable caching of pairwise inference (skip on OOM resume)
+resume: true  # Enable caching of inference outputs (skip on resume)
+
+# TSDF Fusion Parameters (advanced)
+tsdf:
+  voxel_length: 0.004       # 4mm voxel resolution (maximum quality)
+  sdf_trunc: 0.02           # 20mm truncation distance
+  depth_trunc: 10.0         # Maximum depth in meters

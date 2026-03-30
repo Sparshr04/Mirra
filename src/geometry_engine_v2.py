@@ -1,7 +1,7 @@
 """
 src/geometry_engine_v2.py
 ─────────────────────────
-VGGT-based Geometry Engine — Maximum Quality Tier.
+VGGT-based Geometry Engine — with MPS Memory Optimization.
 
 Replaces the DUSt3R-based GeometryEngine with Facebook's Visual Geometry
 Grounded Transformer (VGGT-1B). A single forward pass produces:
@@ -9,9 +9,12 @@ Grounded Transformer (VGGT-1B). A single forward pass produces:
   • Metric depth maps
   • Dense 3D pointmaps in world coordinates
 
-This eliminates the O(N²) pairwise inference and 300-iteration global
-alignment stages, reducing geometry estimation from ~90s to < 1s. The
-metric-scale output also enables proper TSDF volumetric fusion downstream.
+Memory Optimizations (M2 MPS):
+  • Aggressive tensor cleanup after inference (gc + mps.empty_cache)
+  • Immediate .cpu() conversion of prediction tensors
+  • Model unloading after inference in subprocess workers
+  • Configurable precision (float32 / bfloat16) via config
+  • Configurable input resolution downscale via vggt_resolution
 
 Outputs (backward-compatible with FusionEngine contract):
   • outputs/geometry/reconstruction.ply
@@ -24,10 +27,10 @@ Outputs (backward-compatible with FusionEngine contract):
   the per-frame depth maps enable depth-supervised splat initialization.
 """
 
+import gc
 import os
 import sys
 import subprocess
-import argparse
 import time
 
 import torch
@@ -37,9 +40,25 @@ import hydra
 from omegaconf import DictConfig
 import matplotlib.pyplot as plt
 import open3d as o3d
-import torchvision.transforms as tvf
 
 from src.video_utils import get_device, find_video, extract_frames
+
+
+# ─── MPS Memory Management ──────────────────────────────────────────
+
+
+def _flush_mps_memory():
+    """Aggressively reclaim MPS unified memory.
+
+    On Apple Silicon, GPU and CPU share the same physical RAM.
+    We must explicitly flush the MPS allocator cache AND trigger
+    Python garbage collection to actually reclaim memory.
+    """
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ─── VGGT Dependency Management ─────────────────────────────────────
@@ -99,7 +118,10 @@ except ImportError as e:
 
 
 def _to_numpy(x):
-    """Safely convert a tensor or numpy array to a numpy array."""
+    """Safely convert a tensor or numpy array to a numpy array.
+
+    Immediately moves tensors to CPU to free MPS/CUDA memory.
+    """
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().float().numpy()
     return np.asarray(x)
@@ -142,6 +164,10 @@ class GeometryEngineV2:
       2. Global alignment (eliminated: 300 iterations → 0)
 
     Produces metric-scale depth, camera poses, and dense pointmaps.
+
+    Config Levers:
+      • vggt_resolution: Downscale input frames (default 518, VGGT native)
+      • vggt_precision: float32 (max quality) or bfloat16 (half memory)
     """
 
     def __init__(self, cfg: DictConfig):
@@ -155,16 +181,23 @@ class GeometryEngineV2:
             else os.getcwd()
         )
 
-        # Determine dtype: bfloat16 on Ampere+, float32 for maximum quality
-        # User directive: absolute maximum accuracy — use float32
-        self.dtype = torch.float32
-        print(f"  Precision: {self.dtype} (maximum quality mode)")
+        # Determine dtype from config (lever: vggt_precision)
+        precision = cfg.get("vggt_precision", "float32")
+        if precision == "bfloat16":
+            self.dtype = torch.bfloat16
+        else:
+            self.dtype = torch.float32
+        print(f"  Precision: {self.dtype} (config: {precision})")
+
+        # VGGT input resolution (lever: vggt_resolution)
+        self.vggt_resolution = cfg.get("vggt_resolution", 518)
+        print(f"  VGGT input resolution: {self.vggt_resolution}")
 
         # Load VGGT model
         print("Loading VGGT-1B model from Hugging Face...")
         t0 = time.time()
         self.model = VGGT.from_pretrained("facebook/VGGT-1B")
-        self.model = self.model.to(self.device).eval()
+        self.model = self.model.to(device=self.device, dtype=self.dtype).eval()
         print(f"  Model loaded in {time.time() - t0:.1f}s")
 
         # Output directories
@@ -181,7 +214,7 @@ class GeometryEngineV2:
 
         Returns:
             Dictionary with c2w, intrinsics, depth_maps, point_maps,
-            all as numpy arrays.
+            all as numpy arrays (on CPU — MPS memory freed).
         """
         ply_path = os.path.join(self.geo_dir, "reconstruction.ply")
         poses_path = os.path.join(self.geo_dir, "poses.npz")
@@ -189,9 +222,11 @@ class GeometryEngineV2:
 
         # ─── SKIP LOGIC ─────────────────────────────────────────────
         if resume and os.path.exists(ply_path) and os.path.exists(poses_path):
-            depth_files = [
-                f for f in os.listdir(self.depth_dir) if f.endswith(".npy")
-            ] if os.path.exists(self.depth_dir) else []
+            depth_files = (
+                [f for f in os.listdir(self.depth_dir) if f.endswith(".npy")]
+                if os.path.exists(self.depth_dir)
+                else []
+            )
             if len(depth_files) > 0:
                 print(">> Found completed geometry output. Skipping inference.")
                 print(f"   PLY: {ply_path}")
@@ -209,13 +244,22 @@ class GeometryEngineV2:
         os.makedirs(tmp_dir, exist_ok=True)
         image_paths = []
         for i, frame in enumerate(frames):
+            # Optionally downscale for VGGT input (lever: vggt_resolution)
+            if self.vggt_resolution and self.vggt_resolution < frame.shape[0]:
+                frame = cv2.resize(
+                    frame,
+                    (self.vggt_resolution, self.vggt_resolution),
+                    interpolation=cv2.INTER_AREA,
+                )
             path = os.path.join(tmp_dir, f"{i:05d}.png")
             # frame is RGB, cv2 expects BGR
             cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             image_paths.append(path)
 
         # Load and preprocess via VGGT's utility
-        images = load_and_preprocess_images(image_paths).to(self.device)
+        images = load_and_preprocess_images(image_paths).to(
+            device=self.device, dtype=self.dtype
+        )
         # images shape: (1, S, 3, H, W) — batch dim added by VGGT
 
         # ─── INFERENCE ───────────────────────────────────────────────
@@ -225,14 +269,20 @@ class GeometryEngineV2:
         elapsed = time.time() - t0
         print(f"✅ VGGT inference complete in {elapsed:.2f}s")
 
-        # ─── EXTRACT OUTPUTS ─────────────────────────────────────────
+        # ─── EXTRACT OUTPUTS (immediately move to CPU) ───────────────
         # Camera poses: convert pose encoding → extrinsic + intrinsic
         image_hw = images.shape[-2:]  # (H, W) after VGGT preprocessing
+
+        # Free input tensor immediately
+        del images
+        _flush_mps_memory()
+
         extrinsics, intrinsics = pose_encoding_to_extri_intri(
             predictions["pose_enc"], image_hw
         )
         # extrinsics: (B, S, 3, 4), intrinsics: (B, S, 3, 3)
 
+        # Move all tensors to CPU numpy immediately to free MPS memory
         extrinsics = _to_numpy(extrinsics[0])  # (S, 3, 4)
         intrinsics = _to_numpy(intrinsics[0])  # (S, 3, 3)
 
@@ -243,10 +293,18 @@ class GeometryEngineV2:
         depth_maps = _to_numpy(predictions["depth"][0])  # (S, H, W)
 
         # Point maps: (B, S, H, W, 3) — 3D world coordinates
-        point_maps = _to_numpy(predictions["point_map"][0])  # (S, H, W, 3)
+        point_maps = _to_numpy(predictions["world_points"][0])  # (S, H, W, 3)
+
+        # ─── FREE MPS MEMORY ─────────────────────────────────────────
+        # Delete the entire predictions dict and flush the MPS cache.
+        # This reclaims ~2-4GB of unified memory on Apple Silicon.
+        del predictions
+        _flush_mps_memory()
+        print("  🧹 MPS memory flushed after VGGT inference")
 
         # Clean up temporary input files
         import shutil
+
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
         result = {
@@ -263,6 +321,18 @@ class GeometryEngineV2:
 
         return result
 
+    def unload_model(self):
+        """Explicitly unload the VGGT model to free ~4GB of unified memory.
+
+        Call this after inference is complete and before launching
+        another heavy model (e.g., SAM 2).
+        """
+        if hasattr(self, "model") and self.model is not None:
+            del self.model
+            self.model = None
+            _flush_mps_memory()
+            print("  🧹 VGGT model unloaded, memory freed")
+
     def save_outputs(self, result: dict, frames: list[np.ndarray]) -> None:
         """Save point cloud, camera poses, depth maps, and visualization.
 
@@ -270,6 +340,9 @@ class GeometryEngineV2:
           • poses.npz with COLMAP-compatible intrinsics (fx, fy, cx, cy)
           • Per-frame metric depth maps as .npy files
           • Dense colored point cloud as .ply
+
+        Memory-optimized: processes frames one at a time and frees
+        intermediate arrays to avoid holding N copies in memory.
         """
         if result is None:
             print(">> Outputs already exist. Skipping save_outputs.")
@@ -299,12 +372,16 @@ class GeometryEngineV2:
             cols = frame_resized.reshape(-1, 3).astype(np.float64) / 255.0
 
             # Filter out invalid points (NaN, Inf, zero-depth)
-            valid = (
-                np.isfinite(pts).all(axis=1)
-                & (depth_maps[i].reshape(-1) > 0.01)
+            valid = np.isfinite(pts).all(axis=1) & (
+                depth_maps[i].reshape(-1) > 0.01
             )
             all_pts.append(pts[valid])
             all_cols.append(cols[valid])
+
+        # Free point_maps now that we've extracted what we need
+        del point_maps
+        result["point_maps"] = None
+        gc.collect()
 
         all_pts = np.concatenate(all_pts, axis=0)
         all_cols = np.concatenate(all_cols, axis=0)
@@ -323,6 +400,10 @@ class GeometryEngineV2:
             )
         else:
             print(f"❌ Failed to write point cloud to {ply_path}")
+
+        # Free the concatenated arrays
+        del all_pts, all_cols, pcd
+        gc.collect()
 
         # ── 2. Save Camera Poses (3DGS-compatible) ───────────────────
         poses_path = os.path.join(self.geo_dir, "poses.npz")
@@ -371,8 +452,7 @@ class GeometryEngineV2:
         )
 
         print(
-            f"✅ Camera poses saved: {poses_path} "
-            f"({N} cameras, 3DGS-ready intrinsics)"
+            f"✅ Camera poses saved: {poses_path} ({N} cameras, 3DGS-ready intrinsics)"
         )
 
         # ── 3. Save Per-Frame Metric Depth Maps ─────────────────────
@@ -423,8 +503,13 @@ class GeometryEngineV2:
 
 # ─── CLI Entry Point ─────────────────────────────────────────────────
 
+
 @hydra.main(version_base=None, config_path="../", config_name="config")
 def main(cfg: DictConfig):
+    from src.config_presets import apply_preset
+
+    cfg = apply_preset(cfg)
+
     engine = GeometryEngineV2(cfg)
 
     video_path = find_video(cfg, engine.project_root)
@@ -437,6 +522,7 @@ def main(cfg: DictConfig):
 
     result = engine.run_inference(frames)
     engine.save_outputs(result, frames)
+    engine.unload_model()
 
 
 if __name__ == "__main__":

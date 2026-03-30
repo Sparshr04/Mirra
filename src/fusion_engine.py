@@ -1,7 +1,7 @@
 """
 src/fusion_engine.py
 ────────────────────
-TSDF Volumetric Fusion Engine — Maximum Quality Tier.
+TSDF Volumetric Fusion Engine — with Config-Driven Parameters.
 
 Completely rewritten from the projection-voting approach to a proper
 Truncated Signed Distance Function (TSDF) volumetric fusion pipeline.
@@ -26,15 +26,28 @@ Pipeline:
     • Per-vertex depth enables depth-supervised training
 """
 
+import gc
 import os
 import json
-import struct
 
 import numpy as np
 import open3d as o3d
 import hydra
 from omegaconf import DictConfig
 from tqdm import tqdm
+
+
+def _flush_mps_memory():
+    """Aggressively reclaim MPS unified memory."""
+    gc.collect()
+    try:
+        import torch
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 class FusionEngine:
@@ -53,28 +66,34 @@ class FusionEngine:
           Rule of thumb: 3–5× voxel_length.
     """
 
-    # TSDF integration parameters — tuned for maximum quality
-    VOXEL_LENGTH = 0.004        # 4mm voxel resolution (high detail)
-    SDF_TRUNC = 0.02            # 20mm truncation (5× voxel)
-
     # Denoiser parameters
-    STAT_NB_NEIGHBORS = 20      # k neighbors for statistical outlier removal
-    STAT_STD_RATIO = 2.0        # Points beyond μ + 2σ are outliers
-    RADIUS_NB_POINTS = 6        # Minimum neighbors within radius
-    RADIUS = 0.015              # Search radius in scene units
+    STAT_NB_NEIGHBORS = 20  # k neighbors for statistical outlier removal
+    STAT_STD_RATIO = 2.0  # Points beyond μ + 2σ are outliers
+    RADIUS_NB_POINTS = 6  # Minimum neighbors within radius
+    RADIUS = 0.015  # Search radius in scene units
 
     # Projection parameters (for semantic voting on mesh)
-    MIN_DEPTH = 0.01            # Minimum valid depth for projection
+    MIN_DEPTH = 0.01  # Minimum valid depth for projection
 
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
-        print("FusionEngine (TSDF) initialized.")
 
         self.project_root = (
             hydra.utils.get_original_cwd()
             if hasattr(hydra.utils, "get_original_cwd")
             else os.getcwd()
         )
+
+        # ─── Config-driven TSDF parameters ───────────────────────────
+        tsdf_cfg = cfg.get("tsdf", {})
+        self.VOXEL_LENGTH = float(tsdf_cfg.get("voxel_length", 0.006))
+        self.SDF_TRUNC = float(tsdf_cfg.get("sdf_trunc", 0.030))
+        self.DEPTH_TRUNC = float(tsdf_cfg.get("depth_trunc", 5.0))
+
+        print("FusionEngine (TSDF) initialized.")
+        print(f"  Voxel: {self.VOXEL_LENGTH * 1000:.1f}mm, "
+              f"Trunc: {self.SDF_TRUNC * 1000:.1f}mm, "
+              f"Depth max: {self.DEPTH_TRUNC:.1f}m")
 
     # ─── Data Loading ────────────────────────────────────────────────
 
@@ -85,18 +104,14 @@ class FusionEngine:
             depth_maps: list of (H, W) float32 arrays
             count: number of depth maps loaded
         """
-        depth_dir = os.path.join(
-            self.project_root, "outputs", "geometry", "depth"
-        )
+        depth_dir = os.path.join(self.project_root, "outputs", "geometry", "depth")
         if not os.path.exists(depth_dir):
             raise FileNotFoundError(
                 f"Depth maps directory not found: {depth_dir}. "
                 "Run GeometryEngineV2 first."
             )
 
-        depth_files = sorted(
-            [f for f in os.listdir(depth_dir) if f.endswith(".npy")]
-        )
+        depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith(".npy")])
         if not depth_files:
             raise FileNotFoundError(f"No depth map .npy files in {depth_dir}")
 
@@ -118,9 +133,7 @@ class FusionEngine:
         if not os.path.exists(frames_dir):
             raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
 
-        frame_files = sorted(
-            [f for f in os.listdir(frames_dir) if f.endswith(".jpg")]
-        )
+        frame_files = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
         print(f"Loading {len(frame_files)} RGB frames from {frames_dir}...")
 
         frames = []
@@ -142,9 +155,7 @@ class FusionEngine:
             image_names: (N,) filenames
             image_shapes: (N, 2) as (H, W)
         """
-        poses_path = os.path.join(
-            self.project_root, "outputs", "geometry", "poses.npz"
-        )
+        poses_path = os.path.join(self.project_root, "outputs", "geometry", "poses.npz")
         if not os.path.exists(poses_path):
             raise FileNotFoundError(f"Camera poses not found: {poses_path}")
 
@@ -187,16 +198,12 @@ class FusionEngine:
 
     def load_masks(self) -> dict:
         """Load semantic masks from semantics engine output."""
-        masks_dir = os.path.join(
-            self.project_root, "outputs", "semantics", "masks"
-        )
+        masks_dir = os.path.join(self.project_root, "outputs", "semantics", "masks")
         if not os.path.exists(masks_dir):
             raise FileNotFoundError(f"Masks directory not found: {masks_dir}")
 
         print(f"Loading semantic masks from {masks_dir}...")
-        mask_files = sorted(
-            [f for f in os.listdir(masks_dir) if f.endswith(".npz")]
-        )
+        mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith(".npz")])
 
         all_masks = {}
         for fname in mask_files:
@@ -266,6 +273,7 @@ class FusionEngine:
             # Resize frame to match depth map dimensions if needed
             if frame.shape[0] != H or frame.shape[1] != W:
                 import cv2
+
                 frame = cv2.resize(frame, (W, H))
 
             # Build Open3D intrinsic from the 3×3 matrix
@@ -290,13 +298,16 @@ class FusionEngine:
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
                 color_o3d,
                 depth_o3d,
-                depth_scale=1.0,        # Depth already in meters (metric)
-                depth_trunc=10.0,       # Max depth in meters
+                depth_scale=1.0,  # Depth already in meters (metric)
+                depth_trunc=self.DEPTH_TRUNC,  # Config-driven max depth
                 convert_rgb_to_intensity=False,
             )
 
             # Integrate this frame into the volume
             volume.integrate(rgbd, o3d_intrinsic, w2c)
+
+            # Free transient Open3D objects to reclaim memory
+            del depth_o3d, color_o3d, rgbd
 
         # ── Extract mesh (Marching Cubes) ────────────────────────────
         print("\nExtracting triangle mesh via Marching Cubes...")
@@ -305,10 +316,7 @@ class FusionEngine:
 
         n_vertices = len(mesh.vertices)
         n_triangles = len(mesh.triangles)
-        print(
-            f"✅ Mesh extracted: {n_vertices:,} vertices, "
-            f"{n_triangles:,} triangles"
-        )
+        print(f"✅ Mesh extracted: {n_vertices:,} vertices, {n_triangles:,} triangles")
 
         # ── Also extract dense point cloud ───────────────────────────
         print("Extracting dense point cloud from TSDF...")
@@ -426,6 +434,27 @@ class FusionEngine:
             frame_masks = masks[view_idx]
             for obj_id, mask in frame_masks.items():
                 col = obj_id_to_col[obj_id]
+                # --- BOUNDARY PATCH: Ensure projected points don't exceed mask dimensions ---
+                mask_h, mask_w = mask.shape[:2]
+
+                # 1. Identify which points actually fall inside the image
+                in_bounds = (
+                    (v_valid >= 0)
+                    & (v_valid < mask_h)
+                    & (u_valid >= 0)
+                    & (u_valid < mask_w)
+                )
+
+                # 2. Filter the pixel coordinates
+                v_valid = v_valid[in_bounds]
+                u_valid = u_valid[in_bounds]
+
+                # 3. IMPORTANT: You also must filter whatever array tracks your 3D point IDs!
+                # Look at the lines right above this in your code. If there is a variable
+                # like `pt_indices`, `valid_idx`, or `points_in_cam`, you must filter it too:
+                # Example: pt_indices = pt_indices[in_bounds]
+                # --------------------------------------------------------------------------
+
                 hits = mask[v_valid, u_valid]
                 votes[valid_indices[hits], col] += 1
 
@@ -437,7 +466,9 @@ class FusionEngine:
             labels[has_votes] = np.array(obj_id_list)[best_cols]
 
         labeled_count = np.sum(labels > 0)
-        print(f"Labeled {labeled_count:,}/{P:,} vertices ({100 * labeled_count / P:.1f}%)")
+        print(
+            f"Labeled {labeled_count:,}/{P:,} vertices ({100 * labeled_count / P:.1f}%)"
+        )
         return labels
 
     # ─── Denoiser (Integrated) ───────────────────────────────────────
@@ -525,9 +556,7 @@ class FusionEngine:
         labeled_mask = lbls > 0
         unlabeled = ~labeled_mask
 
-        final_colors[unlabeled] = (
-            (cols[unlabeled] * 255).clip(0, 255).astype(np.uint8)
-        )
+        final_colors[unlabeled] = (cols[unlabeled] * 255).clip(0, 255).astype(np.uint8)
 
         if np.any(labeled_mask):
             label_ids = lbls[labeled_mask]
@@ -579,11 +608,7 @@ class FusionEngine:
             "property uchar blue\n"
         )
         if has_normals:
-            props += (
-                "property float nx\n"
-                "property float ny\n"
-                "property float nz\n"
-            )
+            props += "property float nx\nproperty float ny\nproperty float nz\n"
         props += "property int label_id\n"
 
         header = (
@@ -596,18 +621,32 @@ class FusionEngine:
 
         # Build structured array
         if has_normals:
-            vertex_dtype = np.dtype([
-                ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                ("r", "u1"), ("g", "u1"), ("b", "u1"),
-                ("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4"),
-                ("label", "<i4"),
-            ])
+            vertex_dtype = np.dtype(
+                [
+                    ("x", "<f4"),
+                    ("y", "<f4"),
+                    ("z", "<f4"),
+                    ("r", "u1"),
+                    ("g", "u1"),
+                    ("b", "u1"),
+                    ("nx", "<f4"),
+                    ("ny", "<f4"),
+                    ("nz", "<f4"),
+                    ("label", "<i4"),
+                ]
+            )
         else:
-            vertex_dtype = np.dtype([
-                ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                ("r", "u1"), ("g", "u1"), ("b", "u1"),
-                ("label", "<i4"),
-            ])
+            vertex_dtype = np.dtype(
+                [
+                    ("x", "<f4"),
+                    ("y", "<f4"),
+                    ("z", "<f4"),
+                    ("r", "u1"),
+                    ("g", "u1"),
+                    ("b", "u1"),
+                    ("label", "<i4"),
+                ]
+            )
 
         vertices = np.zeros(n, dtype=vertex_dtype)
         vertices["x"] = pts[:, 0].astype(np.float32)
@@ -660,9 +699,7 @@ class FusionEngine:
     def save_label_map(self, labels, output_path):
         """Save a JSON mapping of label IDs to names."""
         unique_labels = np.unique(labels[labels > 0])
-        label_map = {
-            int(label_id): f"object_{label_id}" for label_id in unique_labels
-        }
+        label_map = {int(label_id): f"object_{label_id}" for label_id in unique_labels}
         with open(output_path, "w") as f:
             json.dump(label_map, f, indent=2)
         print(f"✅ Label map saved: {output_path} ({len(label_map)} unique labels)")
@@ -777,9 +814,7 @@ class FusionEngine:
 
         # Semantic point cloud (backward-compatible with frontend viewer)
         semantic_ply_path = os.path.join(final_dir, "semantic_world.ply")
-        self.save_semantic_ply(
-            points, colors, labels, normals, semantic_ply_path
-        )
+        self.save_semantic_ply(points, colors, labels, normals, semantic_ply_path)
 
         # Watertight triangle mesh
         mesh_path = os.path.join(final_dir, "semantic_mesh.ply")
@@ -801,6 +836,7 @@ class FusionEngine:
 
 
 # ─── CLI Entry Point ─────────────────────────────────────────────────
+
 
 @hydra.main(version_base=None, config_path="../", config_name="config")
 def main(cfg: DictConfig):

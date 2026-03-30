@@ -1,21 +1,56 @@
-# Configuration for Mirra — Semantic 3D Reconstruction Pipeline
-# Architecture: Maximum Quality Tier (VGGT + SAM 2 + TSDF)
+# ═══════════════════════════════════════════════════════════════════════
+# Mirra — Semantic 3D Reconstruction Pipeline
+# Architecture: VGGT-1B + SAM 2 + TSDF Volumetric Fusion
+# ═══════════════════════════════════════════════════════════════════════
+#
+# ┌────────────────────────────────────────────────────────────────────┐
+# │ PRESET QUICK-REFERENCE TABLE                                      │
+# │                                                                    │
+# │  Lever                │  draft   │  default  │  high_quality      │
+# │  ─────────────────────┼──────────┼───────────┼──────────────────  │
+# │  stride               │  200     │  100      │  50                │
+# │  resolution           │  384     │  512      │  512               │
+# │  vggt_resolution      │  384     │  518      │  518               │
+# │  vggt_precision       │  bfloat16│  float32  │  float32           │
+# │  parallel_stages      │  false   │  false    │  true              │
+# │  keyframe_interval    │  20      │  10       │  5                 │
+# │  sam2_max_objects      │  15      │  30       │  50                │
+# │  tsdf.voxel_length    │  0.010   │  0.006    │  0.004             │
+# │  tsdf.sdf_trunc       │  0.050   │  0.030    │  0.020             │
+# │  tsdf.depth_trunc     │  3.0     │  5.0      │  10.0              │
+# │  enable_denoiser      │  false   │  true     │  true              │
+# └────────────────────────────────────────────────────────────────────┘
+#
+# Usage:
+#   uv run python main.py                        # uses 'default' preset
+#   uv run python main.py preset=draft           # fast/draft mode
+#   uv run python main.py preset=high_quality    # maximum quality
+#   uv run python main.py preset=draft stride=50 # override individual levers
 
-# Hardware / Compute
-device: "cuda" #cuda/cpu/mps
+# ─── Preset Selection ────────────────────────────────────────────────
+# One of: "draft", "default", "high_quality"
+# Individual values below can override the preset.
+preset: "default"
 
-# Reconstruction Parameters
-resolution: 512
-stride: 45
+# ─── Hardware / Compute ──────────────────────────────────────────────
+device: "mps"                   # cuda / cpu / mps
 
-# Geometry Backend
-geometry_backend: "vggt"    # "vggt" (recommended) or "dust3r" (legacy)
+# ─── Frame Extraction ────────────────────────────────────────────────
+resolution: 512                 # Resize extracted frames to NxN pixels
+stride: 100                    # Process every N-th video frame
 
-# Pipeline Execution
-parallel_stages: true       # Run geometry + semantics concurrently
-enable_denoiser: true       # Statistical + radius outlier removal
+# ─── Geometry Backend (VGGT) ─────────────────────────────────────────
+geometry_backend: "vggt"        # "vggt" (recommended) or "dust3r" (legacy)
+vggt_resolution: 518            # Downscale frames before VGGT inference
+                                # (VGGT native is 518; lower = faster + less VRAM)
+vggt_precision: "float32"       # "float32" (max quality) or "bfloat16" (half memory)
 
-# Paths
+# ─── Pipeline Execution ─────────────────────────────────────────────
+parallel_stages: false          # Run geometry + semantics concurrently
+                                # ⚠️  Requires ~8GB+ unified memory (both models loaded)
+enable_denoiser: true           # Statistical + radius outlier removal on point cloud
+
+# ─── Paths ───────────────────────────────────────────────────────────
 data:
   raw: "data/raw"
   processed: "data/processed"
@@ -27,29 +62,30 @@ outputs:
 
 checkpoints: "checkpoints"
 
-# Semantics (SAM 2)
+# ─── Semantics (SAM 2) ──────────────────────────────────────────────
 semantics:
   model_type: "sam2_hiera_large"
   min_mask_region_area: 100
   checkpoint_path: "checkpoints/sam2_hiera_large.pt"
   config_path: "sam2_hiera_l.yaml"
-  keyframe_interval: 10     # Auto-mask every N-th frame (multi-keyframe)
+  keyframe_interval: 10         # Auto-mask every N-th frame (multi-keyframe)
+  max_objects: 30               # Cap on tracked objects (OOM guard)
 
 depth_model:
-  type: "vggt"  # Metric depth from VGGT (replaces MiDaS)
+  type: "vggt"
 
-# Unified Dataset Paths (single source of truth for both engines)
+# ─── Unified Dataset Paths ──────────────────────────────────────────
 dataset:
   raw_video_dir: "data/raw"
   processed_frames_dir: "data/processed/frames"
-  video_filename: ""  # Leave empty to auto-detect first video in raw_video_dir
+  video_filename: ""            # Leave empty to auto-detect newest video
   force_reprocess: false
 
-# Geometry Engine Checkpointing
-resume: true  # Enable caching of inference outputs (skip on resume)
+# ─── Geometry Engine Checkpointing ───────────────────────────────────
+resume: true                    # Cache inference outputs; skip on re-run
 
-# TSDF Fusion Parameters (advanced)
+# ─── TSDF Fusion Parameters ─────────────────────────────────────────
 tsdf:
-  voxel_length: 0.004       # 4mm voxel resolution (maximum quality)
-  sdf_trunc: 0.02           # 20mm truncation distance
-  depth_trunc: 10.0         # Maximum depth in meters
+  voxel_length: 0.006           # Voxel resolution in meters (6mm default)
+  sdf_trunc: 0.030              # SDF truncation distance (5× voxel_length)
+  depth_trunc: 5.0              # Maximum depth in meters to integrate

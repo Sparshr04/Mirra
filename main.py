@@ -34,14 +34,28 @@ def main(cfg: DictConfig):
         else os.getcwd()
     )
 
+    # ─── Detect input mode ────────────────────────────────────────────────
+    # Photo-dir mode: uses pre-captured wide-baseline photos (optimal for DUSt3R)
+    # Video mode: extracts frames from .mp4 at configured stride
+    use_photos = bool(cfg.dataset.get("photo_dir", ""))
+    if use_photos:
+        print(f"\n📷 Photo-folder mode: '{cfg.dataset.photo_dir}'")
+    else:
+        print("\n🎥 Video mode")
+
     # ─── STAGE 1: GEOMETRY ───────────────────────────────────────────────
     print("\n[1/3] Running Geometry Engine...")
     try:
         geo_engine = GeometryEngine(cfg)
-        video_path = geo_engine._find_video()
-        print(f"Processing video: {video_path}")
 
-        frames = geo_engine.extract_frames(video_path)
+        if use_photos and geo_engine.has_photo_dir():
+            print(f"Loading photos from: {cfg.dataset.photo_dir}")
+            frames = geo_engine.load_photos_from_dir()
+        else:
+            video_path = geo_engine._find_video()
+            print(f"Processing video: {video_path}")
+            frames = geo_engine.extract_frames(video_path)
+
         if not frames:
             print("❌ No frames extracted. Aborting.")
             sys.exit(1)
@@ -57,10 +71,16 @@ def main(cfg: DictConfig):
     print("\n[2/3] Running Semantic Engine...")
     try:
         sem_engine = SemanticEngine(cfg)
-        video_path = sem_engine._find_video()
-        print(f"Processing video: {video_path}")
 
-        output_masks, frames_dir = sem_engine.process_video(video_path)
+        if use_photos and sem_engine.has_photo_dir():
+            # Photos already loaded into processed_frames_dir by GeometryEngine
+            frames_dir = sem_engine.get_photo_frames_dir()
+            output_masks, frames_dir = sem_engine.process_video_from_frames(frames_dir)
+        else:
+            video_path = sem_engine._find_video()
+            print(f"Processing video: {video_path}")
+            output_masks, frames_dir = sem_engine.process_video(video_path)
+
         sem_engine.save_outputs(output_masks, frames_dir)
         print("✅ Semantics stage complete.")
     except Exception as e:

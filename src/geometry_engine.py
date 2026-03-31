@@ -142,6 +142,14 @@ class GeometryEngine:
         else:
             return "cpu"
 
+    def has_photo_dir(self):
+        """Check if a photo directory is configured and exists."""
+        photo_dir = self.cfg.dataset.get("photo_dir", "")
+        if not photo_dir:
+            return False
+        abs_photo_dir = os.path.join(self.project_root, photo_dir)
+        return os.path.isdir(abs_photo_dir)
+
     def _find_video(self):
         """
         Locate the input video using the unified dataset config.
@@ -169,6 +177,119 @@ class GeometryEngine:
                 return matches[0]
 
         raise FileNotFoundError(f"No video files found in {raw_dir}")
+
+    def load_photos_from_dir(self):
+        """Load images from a photo directory for wide-baseline reconstruction.
+
+        DUSt3R is optimized for unordered, wide-baseline images rather than
+        dense video frames. This method provides a direct photo-folder input
+        path that skips video extraction entirely.
+
+        Reads all .jpg/.png files from the configured photo_dir, resizes
+        them to the configured resolution, and saves them to the shared
+        processed_frames_dir so downstream engines can reuse them.
+
+        Returns:
+            List[np.ndarray]: RGB frames (H, W, 3) ready for DUSt3R inference.
+        """
+        photo_dir_cfg = self.cfg.dataset.get("photo_dir", "")
+        photo_dir = os.path.join(self.project_root, photo_dir_cfg)
+
+        if not os.path.isdir(photo_dir):
+            raise FileNotFoundError(f"Photo directory not found: {photo_dir}")
+
+        # Collect all image files (sorted for deterministic ordering)
+        extensions = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
+        image_files = sorted(
+            f for f in os.listdir(photo_dir)
+            if f.endswith(extensions)
+        )
+
+        if not image_files:
+            raise FileNotFoundError(
+                f"No .jpg/.png images found in {photo_dir}. "
+                f"Place your wide-baseline photos there."
+            )
+
+        resolution = self.cfg.resolution
+        frames_dir = os.path.join(
+            self.project_root, self.cfg.dataset.processed_frames_dir
+        )
+
+        # --- Check cache validity ---
+        # Use a synthetic "source name" for photo-dir caching
+        source_name = f"photo_dir:{os.path.basename(photo_dir)}"
+        metadata_path = os.path.join(frames_dir, "metadata.json")
+        cache_valid = False
+
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, "r") as f:
+                    metadata = json.load(f)
+                if (
+                    metadata.get("source_video_name") == source_name
+                    and metadata.get("num_frames") == len(image_files)
+                    and metadata.get("resolution") == resolution
+                    and not self.cfg.dataset.get("force_reprocess", False)
+                ):
+                    cache_valid = True
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        if cache_valid:
+            existing = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
+            if len(existing) == len(image_files):
+                print(
+                    f"Found {len(existing)} cached photos from '{photo_dir_cfg}'. "
+                    f"Reusing them."
+                )
+                frames = []
+                for fname in existing:
+                    img = cv2.imread(os.path.join(frames_dir, fname))
+                    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    frames.append(rgb)
+                return frames
+
+        # --- Fresh load + resize ---
+        if os.path.exists(frames_dir):
+            shutil.rmtree(frames_dir)
+        os.makedirs(frames_dir, exist_ok=True)
+
+        print(f"Loading {len(image_files)} photos from {photo_dir}...")
+        print(f"  Resizing to {resolution}×{resolution}")
+
+        frames = []
+        for i, fname in enumerate(image_files):
+            img_path = os.path.join(photo_dir, fname)
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"  ⚠️  Skipping unreadable file: {fname}")
+                continue
+
+            resized = cv2.resize(img, (resolution, resolution))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            frames.append(rgb)
+
+            # Save to shared frames_dir with sequential naming
+            save_path = os.path.join(frames_dir, f"{i:05d}.jpg")
+            cv2.imwrite(save_path, resized)
+
+        print(f"  ✅ Loaded {len(frames)} photos → {frames_dir}")
+
+        # Write metadata for cache validation
+        metadata = {
+            "source_video_name": source_name,
+            "timestamp": time.time(),
+            "num_frames": len(frames),
+            "stride": 1,
+            "resolution": resolution,
+            "input_type": "photo_dir",
+            "photo_dir": photo_dir_cfg,
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        return frames
 
     def _validate_frame_cache(self, frames_dir, video_path):
         """
@@ -330,10 +451,16 @@ class GeometryEngine:
 
         # Try on MPS first, fallback to CPU on OOM
         try:
-            scene.compute_global_alignment(
+            loss = scene.compute_global_alignment(
                 init="mst", niter=300, schedule="linear", lr=0.01
             )
-            print(f"✅ Global alignment complete on {self.device}.")
+            if np.isnan(float(loss)):
+                print("⚠️  WARNING: Global alignment converged to NaN loss!")
+                print("   This usually means the input resolution doesn't match the model.")
+                print(f"   Config resolution: {self.cfg.resolution}, Model expects: 512")
+                print("   Fix: set 'resolution: 512' in config.yaml")
+            else:
+                print(f"✅ Global alignment complete on {self.device} (loss={float(loss):.4f}).")
         except RuntimeError as e:
             if "out of memory" in str(e).lower() or "mps" in str(e).lower():
                 print(
@@ -374,8 +501,21 @@ class GeometryEngine:
                 }
             )
 
+        # Auto-select scene graph based on input type and frame count.
+        # - "complete": O(N²) pairs — best for ≤15 wide-baseline photos
+        # - "swin-5-2": O(N) sliding window — best for sequential video frames
+        n_frames = len(frames)
+        is_photo_input = self.cfg.dataset.get("photo_dir", "") != ""
+
+        if is_photo_input and n_frames <= 15:
+            scene_graph = "complete"
+            print(f"  Using 'complete' scene graph ({n_frames} photos, {n_frames*(n_frames-1)} pairs)")
+        else:
+            scene_graph = "swin-5-2"
+            print(f"  Using 'swin-5-2' scene graph ({n_frames} frames)")
+
         pairs = make_pairs(
-            dust3r_frames, scene_graph="swin-5-2", prefilter=None, symmetrize=True
+            dust3r_frames, scene_graph=scene_graph, prefilter=None, symmetrize=True
         )
 
         # batch_size=1 is crucial for MPS memory safety
@@ -463,11 +603,20 @@ class GeometryEngine:
 
             # Filter out NaN / Inf points
             valid = np.isfinite(p).all(axis=1)
+            n_valid = valid.sum()
+            if n_valid == 0:
+                print(f"  ⚠️  View {i}: 0/{len(p)} valid points (all NaN/Inf)")
             all_pts.append(p[valid])
             all_cols.append(c[valid])
 
         all_pts = np.concatenate(all_pts, axis=0)
         all_cols = np.concatenate(all_cols, axis=0)
+
+        if all_pts.shape[0] == 0:
+            print("❌ ERROR: No valid 3D points after filtering NaN/Inf!")
+            print("   This means global alignment failed completely.")
+            print("   Check that config 'resolution' matches the DUSt3R model (512 for ViTLarge_512).")
+            return
 
         # Clamp colors to [0, 1] range (DUSt3R may output slightly out-of-range)
         all_cols = np.clip(all_cols, 0.0, 1.0)

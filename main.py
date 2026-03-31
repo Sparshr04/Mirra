@@ -100,10 +100,19 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
     # Re-initialize manually (bypass Hydra in subprocess)
     engine.device = get_device(cfg)
 
-    # Apply precision from config
+    # Apply precision from config (mirror the MPS bfloat16→float16 pivot
+    # from GeometryEngineV2.__init__ — this worker bypasses __init__)
     precision = cfg.get("vggt_precision", "float32")
-    engine.dtype = torch.bfloat16 if precision == "bfloat16" else torch.float32
+    device = engine.device
+    if precision == "bfloat16" and str(device) == "mps":
+        engine.dtype = torch.float16
+        print("[Geometry Worker] Pivoted bfloat16 → float16 for MPS")
+    elif precision == "bfloat16":
+        engine.dtype = torch.bfloat16
+    else:
+        engine.dtype = torch.float32
     engine.vggt_resolution = cfg.get("vggt_resolution", 518)
+    engine.chunk_size = cfg.get("vggt_chunk_size", 4)
 
     # Load VGGT model
     print("[Geometry Worker] Loading VGGT-1B model...")

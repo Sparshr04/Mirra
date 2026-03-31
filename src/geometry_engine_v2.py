@@ -29,6 +29,7 @@ Outputs (backward-compatible with FusionEngine contract):
 
 import gc
 import os
+import shutil
 import sys
 import subprocess
 import time
@@ -56,6 +57,10 @@ def _flush_mps_memory():
     """
     gc.collect()
     if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        # Synchronize first — MPS operations are async; without this,
+        # Metal may still be computing on buffers we're trying to free.
+        if hasattr(torch.mps, "synchronize"):
+            torch.mps.synchronize()
         torch.mps.empty_cache()
     elif torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -168,6 +173,13 @@ class GeometryEngineV2:
     Config Levers:
       • vggt_resolution: Downscale input frames (default 518, VGGT native)
       • vggt_precision: float32 (max quality) or bfloat16 (half memory)
+      • vggt_chunk_size: Frames per forward pass (default 4; prevents OOM)
+
+    Chunked Inference:
+      ViT attention scales as O(S²) in the sequence dimension.
+      Processing all frames at once causes Metal to request a single
+      12GB+ MTLBuffer allocation, which crashes on M2 (16GB unified).
+      Chunking processes 3-5 frames at a time, keeping peak VRAM ~3GB.
     """
 
     def __init__(self, cfg: DictConfig):
@@ -182,16 +194,32 @@ class GeometryEngineV2:
         )
 
         # Determine dtype from config (lever: vggt_precision)
+        # ── MPS bfloat16 → float16 PIVOT ──────────────────────────────
+        # Apple's Metal backend natively supports float16 via its GPU ALUs,
+        # but bfloat16 support is emulated and causes silent type promotion
+        # bugs: internal ops (F.interpolate, BatchNorm) cast intermediates
+        # back to float32 (MPSFloatType), which then collide with bfloat16
+        # weights (MPSBFloat16Type) in F.conv_transpose2d inside the DPT
+        # head. We intercept this at model-load time.
         precision = cfg.get("vggt_precision", "float32")
-        if precision == "bfloat16":
+        if precision == "bfloat16" and str(self.device) == "mps":
+            self.dtype = torch.float16
+            print("  Precision: float16 (config requested bfloat16, "
+                  "pivoted to float16 for MPS compatibility)")
+        elif precision == "bfloat16":
             self.dtype = torch.bfloat16
+            print(f"  Precision: {self.dtype} (config: {precision})")
         else:
             self.dtype = torch.float32
-        print(f"  Precision: {self.dtype} (config: {precision})")
+            print(f"  Precision: {self.dtype} (config: {precision})")
 
         # VGGT input resolution (lever: vggt_resolution)
         self.vggt_resolution = cfg.get("vggt_resolution", 518)
         print(f"  VGGT input resolution: {self.vggt_resolution}")
+
+        # Chunk size for batched inference (lever: vggt_chunk_size)
+        self.chunk_size = cfg.get("vggt_chunk_size", 4)
+        print(f"  Chunk size: {self.chunk_size} frames per forward pass")
 
         # Load VGGT model
         print("Loading VGGT-1B model from Hugging Face...")
@@ -206,8 +234,40 @@ class GeometryEngineV2:
         os.makedirs(self.geo_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
 
+    def _prepare_frame_pngs(self, frames: list[np.ndarray]) -> list[str]:
+        """Save frames as temporary PNGs for VGGT's preprocessor.
+
+        Applies the vggt_resolution downscale if configured.
+        Returns list of file paths.
+        """
+        tmp_dir = os.path.join(self.geo_dir, "_tmp_vggt_input")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        image_paths = []
+        for i, frame in enumerate(frames):
+            if self.vggt_resolution and self.vggt_resolution < frame.shape[0]:
+                frame = cv2.resize(
+                    frame,
+                    (self.vggt_resolution, self.vggt_resolution),
+                    interpolation=cv2.INTER_AREA,
+                )
+            path = os.path.join(tmp_dir, f"{i:05d}.png")
+            cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            image_paths.append(path)
+
+        return image_paths
+
     def run_inference(self, frames: list[np.ndarray]) -> dict:
-        """Run VGGT inference on extracted frames.
+        """Run VGGT inference on extracted frames using chunked processing.
+
+        Because VGGT is a Vision Transformer, the attention matrix scales
+        quadratically with sequence length S. Processing all frames at once
+        (e.g., 15 frames) requests a ~12GB Metal buffer allocation that
+        crashes Apple's MPS backend.
+
+        Solution: Process frames in chunks of `vggt_chunk_size` (default 4).
+        Each chunk runs through VGGT independently, results are immediately
+        moved to CPU numpy, and MPS memory is flushed between chunks.
 
         Args:
             frames: List of RGB numpy arrays (H, W, 3) uint8.
@@ -215,6 +275,7 @@ class GeometryEngineV2:
         Returns:
             Dictionary with c2w, intrinsics, depth_maps, point_maps,
             all as numpy arrays (on CPU — MPS memory freed).
+            Returns None if resume cache hit.
         """
         ply_path = os.path.join(self.geo_dir, "reconstruction.ply")
         poses_path = os.path.join(self.geo_dir, "poses.npz")
@@ -235,77 +296,114 @@ class GeometryEngineV2:
                 print("   (Delete these files to re-run VGGT)")
                 return None
 
-        # ─── PREPARE INPUT ───────────────────────────────────────────
-        print(f"\nRunning VGGT inference on {len(frames)} frames...")
+        # ─── PREPARE FRAME FILES ─────────────────────────────────────
+        N = len(frames)
+        print(
+            f"\nRunning VGGT chunked inference on {N} frames "
+            f"(chunk_size={self.chunk_size})..."
+        )
         t0 = time.time()
 
-        # Save frames as temporary PNGs for VGGT's load_and_preprocess_images
-        tmp_dir = os.path.join(self.geo_dir, "_tmp_vggt_input")
-        os.makedirs(tmp_dir, exist_ok=True)
-        image_paths = []
-        for i, frame in enumerate(frames):
-            # Optionally downscale for VGGT input (lever: vggt_resolution)
-            if self.vggt_resolution and self.vggt_resolution < frame.shape[0]:
-                frame = cv2.resize(
-                    frame,
-                    (self.vggt_resolution, self.vggt_resolution),
-                    interpolation=cv2.INTER_AREA,
-                )
-            path = os.path.join(tmp_dir, f"{i:05d}.png")
-            # frame is RGB, cv2 expects BGR
-            cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            image_paths.append(path)
+        image_paths = self._prepare_frame_pngs(frames)
 
-        # Load and preprocess via VGGT's utility
-        images = load_and_preprocess_images(image_paths).to(
-            device=self.device, dtype=self.dtype
+        # ─── CHUNKED INFERENCE ───────────────────────────────────────
+        # Process frames in chunks to avoid quadratic attention OOM.
+        # Each chunk is a separate forward pass through VGGT.
+        all_extrinsics = []  # list of (chunk_S, 3, 4) numpy
+        all_intrinsics = []  # list of (chunk_S, 3, 3) numpy
+        all_depth_maps = []  # list of (chunk_S, H, W) numpy
+        all_point_maps = []  # list of (chunk_S, H, W, 3) numpy
+        image_hw = None  # (H, W) from VGGT preprocessing
+
+        num_chunks = (N + self.chunk_size - 1) // self.chunk_size
+
+        # Resolve the model's actual weight dtype ONCE (after any
+        # bfloat16→float16 pivot that happened in __init__).
+        model_dtype = next(self.model.parameters()).dtype
+
+        # Determine autocast device type for the forward pass.
+        # torch.autocast catches stray float32 intermediates produced by
+        # F.interpolate / BatchNorm inside VGGT's DPT head and casts them
+        # back to the target precision before they hit conv_transpose2d.
+        autocast_device = "mps" if str(self.device) == "mps" else (
+            "cuda" if torch.cuda.is_available() else "cpu"
         )
-        # images shape: (1, S, 3, H, W) — batch dim added by VGGT
 
-        # ─── INFERENCE ───────────────────────────────────────────────
-        with torch.no_grad():
-            predictions = self.model(images)
+        for chunk_idx in range(num_chunks):
+            start = chunk_idx * self.chunk_size
+            end = min(start + self.chunk_size, N)
+            chunk_paths = image_paths[start:end]
+            chunk_len = end - start
+
+            print(
+                f"\n  [Chunk {chunk_idx + 1}/{num_chunks}] "
+                f"Frames {start}–{end - 1} ({chunk_len} frames)"
+            )
+
+            # Load and preprocess this chunk (NOT all image_paths!)
+            # Cast to the model's exact weight dtype for strict type parity.
+            images = load_and_preprocess_images(chunk_paths).to(
+                device=self.device, dtype=model_dtype
+            )
+            # images shape: (1, chunk_S, 3, H, W)
+
+            # Capture the spatial dimensions (same for all chunks)
+            if image_hw is None:
+                image_hw = images.shape[-2:]  # (H, W)
+
+            # Forward pass with autocast to prevent stray float32
+            # intermediates from colliding with float16/bfloat16 weights
+            # inside the DPT head's conv_transpose2d.
+            with torch.no_grad(), torch.autocast(
+                device_type=autocast_device, dtype=model_dtype
+            ):
+                predictions = self.model(images)
+
+            # ─── EXTRACT TO CPU IMMEDIATELY ──────────────────────────
+            chunk_hw = images.shape[-2:]
+
+            # Camera poses
+            extr, intr = pose_encoding_to_extri_intri(predictions["pose_enc"], chunk_hw)
+            all_extrinsics.append(_to_numpy(extr[0]))  # (chunk_S, 3, 4)
+            all_intrinsics.append(_to_numpy(intr[0]))  # (chunk_S, 3, 3)
+
+            # Depth maps
+            all_depth_maps.append(_to_numpy(predictions["depth"][0]))  # (chunk_S, H, W)
+
+            # Point maps
+            all_point_maps.append(
+                _to_numpy(predictions["world_points"][0])  # (chunk_S, H, W, 3)
+            )
+
+            # ─── FLUSH MPS MEMORY BETWEEN CHUNKS ────────────────────
+            del images, predictions, extr, intr
+            _flush_mps_memory()
+            print(f"    🧹 Chunk {chunk_idx + 1} complete, MPS flushed")
 
         elapsed = time.time() - t0
-        print(f"✅ VGGT inference complete in {elapsed:.2f}s")
-
-        # ─── EXTRACT OUTPUTS (immediately move to CPU) ───────────────
-        # Camera poses: convert pose encoding → extrinsic + intrinsic
-        image_hw = images.shape[-2:]  # (H, W) after VGGT preprocessing
-
-        # Free input tensor immediately
-        del images
-        _flush_mps_memory()
-
-        extrinsics, intrinsics = pose_encoding_to_extri_intri(
-            predictions["pose_enc"], image_hw
+        print(
+            f"\n✅ VGGT chunked inference complete in {elapsed:.2f}s "
+            f"({num_chunks} chunks)"
         )
-        # extrinsics: (B, S, 3, 4), intrinsics: (B, S, 3, 3)
 
-        # Move all tensors to CPU numpy immediately to free MPS memory
-        extrinsics = _to_numpy(extrinsics[0])  # (S, 3, 4)
-        intrinsics = _to_numpy(intrinsics[0])  # (S, 3, 3)
+        # ─── CONCATENATE CHUNK RESULTS ON CPU ────────────────────────
+        extrinsics = np.concatenate(all_extrinsics, axis=0)  # (N, 3, 4)
+        intrinsics = np.concatenate(all_intrinsics, axis=0)  # (N, 3, 3)
+        depth_maps = np.concatenate(all_depth_maps, axis=0)  # (N, H, W)
+        point_maps = np.concatenate(all_point_maps, axis=0)  # (N, H, W, 3)
+
+        # Free the chunk lists
+        del all_extrinsics, all_intrinsics, all_depth_maps, all_point_maps
+        gc.collect()
 
         # Convert w2c extrinsics to c2w
-        c2w = _extrinsic_to_c2w(extrinsics)  # (S, 4, 4)
-
-        # Depth maps: (B, S, H, W)
-        depth_maps = _to_numpy(predictions["depth"][0])  # (S, H, W)
-
-        # Point maps: (B, S, H, W, 3) — 3D world coordinates
-        point_maps = _to_numpy(predictions["world_points"][0])  # (S, H, W, 3)
-
-        # ─── FREE MPS MEMORY ─────────────────────────────────────────
-        # Delete the entire predictions dict and flush the MPS cache.
-        # This reclaims ~2-4GB of unified memory on Apple Silicon.
-        del predictions
-        _flush_mps_memory()
-        print("  🧹 MPS memory flushed after VGGT inference")
+        c2w = _extrinsic_to_c2w(extrinsics)  # (N, 4, 4)
 
         # Clean up temporary input files
-        import shutil
-
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(
+            os.path.join(self.geo_dir, "_tmp_vggt_input"),
+            ignore_errors=True,
+        )
 
         result = {
             "c2w": c2w,
@@ -372,9 +470,7 @@ class GeometryEngineV2:
             cols = frame_resized.reshape(-1, 3).astype(np.float64) / 255.0
 
             # Filter out invalid points (NaN, Inf, zero-depth)
-            valid = np.isfinite(pts).all(axis=1) & (
-                depth_maps[i].reshape(-1) > 0.01
-            )
+            valid = np.isfinite(pts).all(axis=1) & (depth_maps[i].reshape(-1) > 0.01)
             all_pts.append(pts[valid])
             all_cols.append(cols[valid])
 
@@ -426,9 +522,7 @@ class GeometryEngineV2:
         frames_dir = os.path.join(
             self.project_root, self.cfg.dataset.processed_frames_dir
         )
-        image_names = sorted(
-            [f for f in os.listdir(frames_dir) if f.endswith(".jpg")]
-        )
+        image_names = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
 
         # Image shapes
         image_shapes = np.array([[H, W]] * N)
@@ -478,9 +572,7 @@ class GeometryEngineV2:
             d_valid = depth_viz[depth_viz > 0]
             if len(d_valid) > 0:
                 d_min, d_max = np.percentile(d_valid, [1, 99])
-                depth_norm = np.clip(
-                    (depth_viz - d_min) / (d_max - d_min + 1e-6), 0, 1
-                )
+                depth_norm = np.clip((depth_viz - d_min) / (d_max - d_min + 1e-6), 0, 1)
             else:
                 depth_norm = np.zeros_like(depth_viz)
 

@@ -44,6 +44,8 @@ geometry_backend: "vggt"        # "vggt" (recommended) or "dust3r" (legacy)
 vggt_resolution: 518            # Downscale frames before VGGT inference
                                 # (VGGT native is 518; lower = faster + less VRAM)
 vggt_precision: "float32"       # "float32" (max quality) or "bfloat16" (half memory)
+vggt_chunk_size: 4              # Frames per VGGT forward pass (lower = less VRAM)
+                                # ViT attention is O(S²); >5 frames OOMs on 8GB M2
 
 # ─── Pipeline Execution ─────────────────────────────────────────────
 parallel_stages: false          # Run geometry + semantics concurrently

@@ -434,28 +434,17 @@ class FusionEngine:
             frame_masks = masks[view_idx]
             for obj_id, mask in frame_masks.items():
                 col = obj_id_to_col[obj_id]
-                # --- BOUNDARY PATCH: Ensure projected points don't exceed mask dimensions ---
                 mask_h, mask_w = mask.shape[:2]
 
-                # 1. Identify which points actually fall inside the image
-                in_bounds = (
-                    (v_valid >= 0)
-                    & (v_valid < mask_h)
-                    & (u_valid >= 0)
-                    & (u_valid < mask_w)
-                )
+                # Safe clipping: snap OOB pixel coords to image edges
+                # instead of filtering (which would shrink the arrays
+                # and break alignment with valid_indices).
+                # Edge pixels in semantic masks are almost always
+                # background, so clipped points naturally vote "no hit".
+                v_clipped = np.clip(v_valid, 0, mask_h - 1)
+                u_clipped = np.clip(u_valid, 0, mask_w - 1)
 
-                # 2. Filter the pixel coordinates
-                v_valid = v_valid[in_bounds]
-                u_valid = u_valid[in_bounds]
-
-                # 3. IMPORTANT: You also must filter whatever array tracks your 3D point IDs!
-                # Look at the lines right above this in your code. If there is a variable
-                # like `pt_indices`, `valid_idx`, or `points_in_cam`, you must filter it too:
-                # Example: pt_indices = pt_indices[in_bounds]
-                # --------------------------------------------------------------------------
-
-                hits = mask[v_valid, u_valid]
+                hits = mask[v_clipped, u_clipped]
                 votes[valid_indices[hits], col] += 1
 
         # Aggregate: majority vote
@@ -840,6 +829,9 @@ class FusionEngine:
 
 @hydra.main(version_base=None, config_path="../", config_name="config")
 def main(cfg: DictConfig):
+    from src.config_presets import apply_preset
+
+    cfg = apply_preset(cfg)
     engine = FusionEngine(cfg)
     engine.run()
 

@@ -117,10 +117,14 @@ class SemanticEngine:
             raise e
 
     def _get_device(self):
-        if torch.backends.mps.is_available() and self.cfg.device == "mps":
-            return "mps"
-        elif torch.cuda.is_available() and self.cfg.device == "cuda":
+        if torch.cuda.is_available():
+            if getattr(torch.version, "hip", None) is not None:
+                print(
+                    "AMD ROCm / HIP detected. Utilizing AMD Instinct/Radeon acceleration."
+                )
             return "cuda"
+        elif torch.backends.mps.is_available() and self.cfg.device == "mps":
+            return "mps"
         else:
             return "cpu"
 

@@ -5,7 +5,7 @@
 #
 # ┌────────────────────────────────────────────────────────────────────┐
 # │ PRESET QUICK-REFERENCE TABLE                                      │
-# │                                                                    │
+# │                                                                   │
 # │  Lever                │  draft   │  default  │  high_quality      │
 # │  ─────────────────────┼──────────┼───────────┼──────────────────  │
 # │  stride               │  200     │  100      │  50                │
@@ -14,12 +14,12 @@
 # │  vggt_precision       │  bfloat16│  float32  │  float32           │
 # │  parallel_stages      │  false   │  false    │  true              │
 # │  keyframe_interval    │  20      │  10       │  5                 │
-# │  sam2_max_objects      │  15      │  30       │  50                │
+# │  sam2_max_objects     │  15      │  30       │  50                │
 # │  tsdf.voxel_length    │  0.010   │  0.006    │  0.004             │
 # │  tsdf.sdf_trunc       │  0.050   │  0.030    │  0.020             │
 # │  tsdf.depth_trunc     │  3.0     │  5.0      │  10.0              │
 # │  enable_denoiser      │  false   │  true     │  true              │
-# └────────────────────────────────────────────────────────────────────┘
+# └───────────────────────────────────────────────────────────────────┘
 #
 # Usage:
 #   uv run python main.py                        # uses 'default' preset

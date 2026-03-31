@@ -5,6 +5,7 @@ import glob
 import json
 import shutil
 import time
+import pathlib
 import torch
 import numpy as np
 import cv2
@@ -82,11 +83,9 @@ class SemanticEngine:
         self.device = self._get_device()
         print(f"SemanticEngine initialized on device: {self.device}")
 
-        self.project_root = (
-            hydra.utils.get_original_cwd()
-            if hasattr(hydra.utils, "get_original_cwd")
-            else os.getcwd()
-        )
+        # Resolve project root from this file's location (src/ -> parent)
+        # Works in both Hydra CLI mode and FastAPI background tasks
+        self.project_root = str(pathlib.Path(__file__).resolve().parents[1])
         self.checkpoints_dir = os.path.join(self.project_root, "checkpoints")
         os.makedirs(self.checkpoints_dir, exist_ok=True)
 
@@ -139,6 +138,40 @@ class SemanticEngine:
             except Exception as e:
                 print(f"Failed to download checkpoint: {e}")
                 sys.exit(1)
+
+    def has_photo_dir(self):
+        """Check if a photo directory is configured and exists."""
+        photo_dir = self.cfg.dataset.get("photo_dir", "")
+        if not photo_dir:
+            return False
+        abs_photo_dir = os.path.join(self.project_root, photo_dir)
+        return os.path.isdir(abs_photo_dir)
+
+    def get_photo_frames_dir(self):
+        """Return the processed frames directory (already populated by GeometryEngine).
+
+        When using photo-dir input, GeometryEngine has already copied and
+        resized the photos into processed_frames_dir. We just return that
+        path for SAM 2 to consume.
+        """
+        frames_dir = os.path.join(
+            self.project_root, self.cfg.dataset.processed_frames_dir
+        )
+        if not os.path.exists(frames_dir):
+            raise FileNotFoundError(
+                f"Processed frames not found at {frames_dir}. "
+                f"Run GeometryEngine first to populate frames from photo_dir."
+            )
+
+        existing = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
+        if not existing:
+            raise FileNotFoundError(
+                f"No .jpg frames found in {frames_dir}. "
+                f"GeometryEngine should have placed them there."
+            )
+
+        print(f"Using {len(existing)} pre-loaded photo frames from {frames_dir}")
+        return frames_dir
 
     def _find_video(self):
         """
@@ -290,14 +323,34 @@ class SemanticEngine:
         self._save_frame_metadata(frames_dir, video_path, extracted)
         return frames_dir
 
+    def process_video_from_frames(self, frames_dir):
+        """Process pre-existing frames directory (for photo-dir mode).
+
+        Identical to process_video() but skips frame extraction since
+        the frames are already in frames_dir (placed by GeometryEngine).
+        """
+        return self._run_segmentation(frames_dir)
+
     def process_video(self, video_path):
         # 1. Prepare Frames
         frames_dir = self.extract_frames(video_path)
+        # 2. Run segmentation on extracted frames
+        return self._run_segmentation(frames_dir)
 
-        # 2. Initialize Video State
+    def _run_segmentation(self, frames_dir):
+        """Core segmentation logic: auto-prompt Frame 0, propagate through all frames.
+
+        Args:
+            frames_dir: Directory containing sequential JPEG frames.
+
+        Returns:
+            (output_masks, frames_dir) tuple where output_masks is
+            {frame_idx: {obj_id: (H, W) bool mask}}.
+        """
+        # 1. Initialize Video State
         inference_state = self.video_predictor.init_state(video_path=frames_dir)
 
-        # 3. Auto-Prompt Frame 0
+        # 2. Auto-Prompt Frame 0
         print("Generating automatic masks for Frame 0...")
         frame_names = sorted(
             [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
@@ -316,7 +369,7 @@ class SemanticEngine:
 
         output_masks = {}
 
-        # 4. Add Prompts to Video Predictor
+        # 3. Add Prompts to Video Predictor
         final_out_obj_ids = []
         final_out_mask_logits = []
 
@@ -340,7 +393,7 @@ class SemanticEngine:
                 for i, obj_id in enumerate(final_out_obj_ids)
             }
 
-        # 5. Propagate
+        # 4. Propagate
         print("Propagating masks through video...")
         for (
             out_frame_idx,

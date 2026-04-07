@@ -164,52 +164,21 @@ app.mount("/files/raw", StaticFiles(directory=str(RAW_DIR)), name="raw")
 
 def _build_cfg(video_filename: str) -> "OmegaConf":
     """
-    Build a lightweight OmegaConf DictConfig that mirrors config.yaml.
-    This avoids requiring a Hydra launch context inside the API process.
-    Updated for VGGT + TSDF architecture.
+    Build an OmegaConf DictConfig by loading config.yaml directly.
+    This avoids requiring a Hydra launch context inside the API process
+    while staying in sync with the actual configuration file.
+
+    Only overrides the video_filename to match the uploaded file.
     """
-    raw = {
-        # Hardware
-        "device": "cuda",
-        "resolution": 512,
-        "stride": 45,
-        "resume": True,
-        # Architecture
-        "geometry_backend": "vggt",
-        "parallel_stages": False,  # Serial in API (single worker)
-        "enable_denoiser": True,
-        # Paths
-        "data": {"raw": "data/raw", "processed": "data/processed"},
-        "outputs": {
-            "geometry": "outputs/geometry",
-            "semantics": "outputs/semantics",
-            "final": "outputs/final",
-        },
-        "checkpoints": "checkpoints",
-        # Dataset
-        "dataset": {
-            "raw_video_dir": "data/raw",
-            "processed_frames_dir": "data/processed/frames",
-            "video_filename": video_filename,
-            "force_reprocess": False,
-        },
-        # Semantics (SAM 2 with multi-keyframe)
-        "semantics": {
-            "model_type": "sam2_hiera_large",
-            "min_mask_region_area": 100,
-            "checkpoint_path": "checkpoints/sam2_hiera_large.pt",
-            "config_path": "sam2_hiera_l.yaml",
-            "keyframe_interval": 10,
-        },
-        "depth_model": {"type": "vggt"},
-        # TSDF
-        "tsdf": {
-            "voxel_length": 0.004,
-            "sdf_trunc": 0.02,
-            "depth_trunc": 10.0,
-        },
-    }
-    return OmegaConf.create(raw)
+    cfg = OmegaConf.load(str(PROJECT_ROOT / "config.yaml"))
+
+    # Override the video filename to match the uploaded file
+    OmegaConf.update(cfg, "dataset.video_filename", video_filename, merge=False)
+
+    # Force serial execution in API context (single worker)
+    OmegaConf.update(cfg, "parallel_stages", False, merge=False)
+
+    return cfg
 
 
 def _run_pipeline(job_id: str, video_filename: str) -> None:
@@ -217,10 +186,10 @@ def _run_pipeline(job_id: str, video_filename: str) -> None:
     Runs the full 3-stage ML pipeline synchronously in a background thread.
     Updates JOBS[job_id] throughout so the status endpoint can reflect progress.
 
-    Architecture: VGGT + SAM 2 (multi-keyframe) + TSDF Fusion
+    Architecture: DUSt3R + SAM 2 (multi-keyframe) + TSDF Fusion
     Stages:
         0. Shared frame extraction
-        1. GeometryEngineV2 – VGGT depth/pose estimation + point cloud
+        1. GeometryEngineV2 – DUSt3R depth/pose estimation + point cloud
         2. SemanticEngine   – SAM 2 multi-keyframe video segmentation
         3. FusionEngine     – TSDF volumetric fusion + denoiser → outputs
     """
@@ -240,24 +209,24 @@ def _run_pipeline(job_id: str, video_filename: str) -> None:
         # ── Stage 0: Shared frame extraction/ingestion ──────────────────
         logger.info("[%s] Stage 0 – Frame extraction/ingestion", job_id)
         mode, data_path = get_input_data(cfg, str(PROJECT_ROOT))
-        
+
         if mode == "photos":
             frames, frames_dir = ingest_photos(data_path, cfg, str(PROJECT_ROOT))
         else:
             frames, frames_dir = extract_frames(data_path, cfg, str(PROJECT_ROOT))
-            
+
         if not frames:
             raise RuntimeError("No frames could be prepared.")
         logger.info("[%s] Prepared %d frames", job_id, len(frames))
 
-        # ── Stage 1: Geometry (VGGT) ───────────────────────────────────────
-        logger.info("[%s] Stage 1/3 – GeometryEngineV2 (VGGT)", job_id)
+        # ── Stage 1: Geometry (DUSt3R) ──────────────────────────────────────
+        logger.info("[%s] Stage 1/3 – GeometryEngineV2 (DUSt3R)", job_id)
         geo_engine = GeometryEngineV2(cfg)
         result = geo_engine.run_inference(frames)
         geo_engine.save_outputs(result, frames)
         logger.info("[%s] Stage 1/3 – GeometryEngineV2 DONE", job_id)
 
-        # Free VGGT model before loading SAM 2
+        # Free DUSt3R model before loading SAM 2
         del geo_engine.model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -373,6 +342,7 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
         size_bytes=file_size,
     )
 
+
 @app.post(
     "/api/v1/upload/photos",
     response_model=UploadResponse,
@@ -389,13 +359,16 @@ async def upload_photos(files: list[UploadFile] = File(...)) -> UploadResponse:
     if len(files) > 15:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum 15 photos allowed for high-accuracy 3D processing."
+            detail="Maximum 15 photos allowed for high-accuracy 3D processing.",
         )
 
     import shutil
-    ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+    from omegaconf import OmegaConf
 
-    images_dir = RAW_DIR / "images"
+    ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+    cfg = OmegaConf.load(str(PROJECT_ROOT / "config.yaml"))
+    photo_dir = cfg.dataset.get("photo_dir", "data/raw/photos")
+    images_dir = PROJECT_ROOT / photo_dir
     if images_dir.exists():
         shutil.rmtree(images_dir)
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -408,7 +381,7 @@ async def upload_photos(files: list[UploadFile] = File(...)) -> UploadResponse:
         ext = original_name.suffix.lower()
         if ext not in ALLOWED_EXTENSIONS:
             continue
-            
+
         dest_path = images_dir / original_name.name
         try:
             async with aiofiles.open(dest_path, "wb") as out_file:
@@ -418,16 +391,16 @@ async def upload_photos(files: list[UploadFile] = File(...)) -> UploadResponse:
                     if not chunk:
                         break
                     await out_file.write(chunk)
-            
+
             total_size += dest_path.stat().st_size
             saved_files.append(original_name.name)
         except OSError as exc:
             logger.exception("Failed to write uploaded photo.")
-            
+
     if not saved_files:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid photos were uploaded."
+            detail="No valid photos were uploaded.",
         )
 
     logger.info("Uploaded %d photos to %s", len(saved_files), images_dir)
@@ -458,11 +431,15 @@ async def process_video(
     The caller should poll `GET /api/v1/status/{job_id}` for updates.
     """
     if body.filename == "__photos_dir__":
-        video_path = RAW_DIR / "images"
+        from omegaconf import OmegaConf
+
+        cfg = OmegaConf.load(str(PROJECT_ROOT / "config.yaml"))
+        photo_dir = cfg.dataset.get("photo_dir", "data/raw/photos")
+        video_path = PROJECT_ROOT / photo_dir
         if not video_path.is_dir():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Photo directory 'data/raw/images/' not found. Upload photos first."
+                detail=f"Photo directory '{photo_dir}' not found. Upload photos first.",
             )
     else:
         video_path = RAW_DIR / body.filename

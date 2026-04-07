@@ -62,27 +62,41 @@ def get_input_data(cfg: DictConfig, project_root: str) -> tuple[str, str]:
     """Locate the input data: either a photo directory or a video file.
 
     Priority:
-      1. If `data/raw/images/` exists and contains valid .jpg/.png images,
-         return ("photos", "data/raw/images").
-      2. If a specific ``video_filename`` is configured, try using it.
-      3. Otherwise, auto-detect the NEWEST video file in ``raw_video_dir``.
+      1. If ``cfg.dataset.photo_dir`` is set and the resolved directory
+         contains ≥2 valid images (.jpg/.jpeg/.png), return ("photos", path).
+         DUSt3R requires at least 2 images to form a stereo pair.
+      2. Otherwise, fall back to video discovery via ``find_video()``.
 
     Raises:
-        FileNotFoundError: if no video or photos can be found.
+        FileNotFoundError: if neither photos nor video can be found.
     """
-    raw_dir = Path(project_root) / cfg.dataset.raw_video_dir
-    images_dir = raw_dir / "images"
+    # ── 1. Try photo directory from config ────────────────────────────
+    photo_dir = cfg.dataset.get("photo_dir", "")
+    if photo_dir:
+        abs_photo_dir = os.path.join(project_root, photo_dir)
+        if os.path.isdir(abs_photo_dir):
+            valid_extensions = {".jpg", ".jpeg", ".png"}
+            image_files = [
+                f for f in os.listdir(abs_photo_dir)
+                if os.path.isfile(os.path.join(abs_photo_dir, f))
+                and os.path.splitext(f)[1].lower() in valid_extensions
+            ]
+            if len(image_files) >= 2:
+                print(
+                    f"📷 Photo directory detected: {abs_photo_dir} "
+                    f"({len(image_files)} images). Skipping video extraction."
+                )
+                return "photos", abs_photo_dir
+            elif len(image_files) == 1:
+                print(
+                    f"⚠️  Photo directory '{abs_photo_dir}' has only 1 image. "
+                    f"DUSt3R requires ≥2. Falling back to video."
+                )
+            # else: 0 images, silently fall through
+        else:
+            print(f"⚠️  Configured photo_dir '{abs_photo_dir}' does not exist. Falling back to video.")
 
-    if images_dir.exists() and images_dir.is_dir():
-        image_files = []
-        for item in images_dir.iterdir():
-            if item.is_file() and item.suffix.lower() in {".jpg", ".jpeg", ".png"}:
-                image_files.append(item)
-        if image_files:
-            print("Photo directory detected. Skipping video extraction.")
-            return "photos", str(images_dir)
-            
-    # Fallback to video discovery
+    # ── 2. Fallback to video discovery ────────────────────────────────
     return "video", find_video(cfg, project_root)
 
 def find_video(cfg: DictConfig, project_root: str) -> str:

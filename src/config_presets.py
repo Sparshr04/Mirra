@@ -35,9 +35,8 @@ PRESETS = {
     "draft": {
         "stride": 200,
         "resolution": 384,
-        "vggt_resolution": 384,
-        "vggt_precision": "bfloat16",
-        "vggt_chunk_size": 3,
+        "dust3r_batch_size": 1,
+        "max_photos": 10,
         "parallel_stages": False,
         "enable_denoiser": False,
         "semantics.keyframe_interval": 20,
@@ -49,9 +48,8 @@ PRESETS = {
     "default": {
         "stride": 100,
         "resolution": 512,
-        "vggt_resolution": 518,
-        "vggt_precision": "float32",
-        "vggt_chunk_size": 4,
+        "dust3r_batch_size": 1,
+        "max_photos": 15,
         "parallel_stages": False,
         "enable_denoiser": True,
         "semantics.keyframe_interval": 10,
@@ -63,10 +61,9 @@ PRESETS = {
     "high_quality": {
         "stride": 50,
         "resolution": 512,
-        "vggt_resolution": 518,
-        "vggt_precision": "float32",
-        "vggt_chunk_size": 4,
-        "parallel_stages": True,
+        "dust3r_batch_size": 1,
+        "max_photos": 15,
+        "parallel_stages": False,
         "enable_denoiser": True,
         "semantics.keyframe_interval": 5,
         "semantics.max_objects": 50,
@@ -238,9 +235,8 @@ def apply_preset(cfg: DictConfig) -> DictConfig:
 
     # ── Print resolved values for transparency ───────────────────────
     print(f"   stride={cfg.stride}, resolution={cfg.resolution}")
-    print(f"   vggt_resolution={cfg.get('vggt_resolution', 518)}, "
-          f"vggt_precision={cfg.get('vggt_precision', 'float32')}, "
-          f"vggt_chunk_size={cfg.get('vggt_chunk_size', 4)}")
+    print(f"   dust3r_batch_size={cfg.get('dust3r_batch_size', 1)}, "
+          f"max_photos={cfg.get('max_photos', 15)}")
     print(f"   parallel_stages={cfg.parallel_stages}, "
           f"enable_denoiser={cfg.enable_denoiser}")
     print(f"   keyframe_interval={cfg.semantics.keyframe_interval}, "

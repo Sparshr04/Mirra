@@ -1,38 +1,7 @@
 #!/usr/bin/env python3
 """
 Main orchestration script for the Mirra Semantic 3D Reconstruction Pipeline.
-
-Architecture: Preset-Driven (draft / default / high_quality)
-───────────────────────────────────────────────────────────────
-Runs the pipeline with configurable execution modes:
-
-  ┌─ Frame Extraction (shared) ─┐
-  │                              │
-  ├─→ GeometryEngineV2 (VGGT) ──┤  ← runs concurrently (if parallel_stages)
-  │                              │
-  ├─→ SemanticEngine (SAM 2) ───┤  ← runs concurrently (if parallel_stages)
-  │                              │
-  └──────────────┬───────────────┘
-                 │
-                 ▼
-       FusionEngine (TSDF + Denoiser)
-                 │
-                 ▼
-       semantic_world.ply
-       semantic_mesh.ply
-       3dgs_init.npz
-
-Memory Optimization (MPS / Apple Silicon):
-  • _flush_mps_memory() called at every stage boundary
-  • Models explicitly unloaded after inference
-  • Serial mode (default) runs one model at a time
-  • Parallel mode only for ≥16GB unified memory
-
-Config Presets:
-  uv run python main.py                        # 'default' preset
-  uv run python main.py preset=draft           # fast mode (~60s)
-  uv run python main.py preset=high_quality    # max quality
-  uv run python main.py preset=draft stride=50 # override levers
+Architecture: DUSt3R + SAM 2 + TSDF
 """
 
 import gc
@@ -40,29 +9,26 @@ import os
 import sys
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from src.video_utils import get_input_data, extract_frames, ingest_photos
 from src.config_presets import apply_preset
+from src.geometry_engine_v2 import GeometryEngineV2
+from src.semantic_engine import SemanticEngine
+from src.fusion_engine import FusionEngine
 
 
 # ─── MPS Memory Management ──────────────────────────────────────────
 
 
 def _flush_mps_memory():
-    """Aggressively reclaim MPS unified memory.
-
-    On Apple Silicon, GPU and CPU share the same physical RAM.
-    We must explicitly flush the MPS allocator cache AND trigger
-    Python garbage collection to actually reclaim memory.
-    """
+    """Aggressively reclaim MPS unified memory on Apple Silicon."""
     gc.collect()
     if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
         torch.mps.empty_cache()
@@ -70,138 +36,20 @@ def _flush_mps_memory():
         torch.cuda.empty_cache()
 
 
-# ─── Stage Workers (run in separate processes) ──────────────────────
-
-
-def _run_geometry(cfg_dict: dict, mode: str, data_path: str, project_root: str) -> str:
-    """Run the VGGT geometry stage in a subprocess.
-
-    Args:
-        cfg_dict: Serialized OmegaConf config (plain dict for pickling)
-        mode: "video" or "photos"
-        data_path: Path to the input video or photo directory
-        project_root: Project root directory
-
-    Returns:
-        Status message string
-    """
-    import gc
-    import torch
-    from omegaconf import OmegaConf
-    from src.geometry_engine_v2 import GeometryEngineV2
-    from src.video_utils import extract_frames, ingest_photos, get_device
-
-    cfg = OmegaConf.create(cfg_dict)
-
-    # Override project_root since Hydra context isn't available in subprocess
-    engine = GeometryEngineV2.__new__(GeometryEngineV2)
-    engine.cfg = cfg
-    engine.project_root = project_root
-
-    # Re-initialize manually (bypass Hydra in subprocess)
-    engine.device = get_device(cfg)
-
-    # Apply precision from config (mirror the MPS bfloat16→float16 pivot
-    # from GeometryEngineV2.__init__ — this worker bypasses __init__)
-    precision = cfg.get("vggt_precision", "float32")
-    device = engine.device
-    if precision == "bfloat16" and str(device) == "mps":
-        engine.dtype = torch.float16
-        print("[Geometry Worker] Pivoted bfloat16 → float16 for MPS")
-    elif precision == "bfloat16":
-        engine.dtype = torch.bfloat16
-    else:
-        engine.dtype = torch.float32
-    engine.vggt_resolution = cfg.get("vggt_resolution", 518)
-    engine.chunk_size = cfg.get("vggt_chunk_size", 4)
-
-    # Load VGGT model
-    print("[Geometry Worker] Loading VGGT-1B model...")
-    from vggt.models.vggt import VGGT
-
-    engine.model = VGGT.from_pretrained("facebook/VGGT-1B")
-    engine.model = engine.model.to(device=engine.device, dtype=engine.dtype).eval()
-
-    engine.geo_dir = os.path.join(project_root, "outputs", "geometry")
-    engine.depth_dir = os.path.join(engine.geo_dir, "depth")
-    os.makedirs(engine.geo_dir, exist_ok=True)
-    os.makedirs(engine.depth_dir, exist_ok=True)
-
-    # Run inference
-    if mode == "photos":
-        frames, frames_dir = ingest_photos(data_path, cfg, project_root)
-    else:
-        frames, frames_dir = extract_frames(data_path, cfg, project_root)
-        
-    if not frames:
-        return "FAILED: No frames extracted/ingested"
-
-    result = engine.run_inference(frames)
-    engine.save_outputs(result, frames)
-
-    # ─── MEMORY CLEANUP ─────────────────────────────────────────
-    engine.unload_model()
-    del engine, result, frames
-    gc.collect()
-    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
-
-    return "SUCCESS"
-
-
-def _run_semantics(cfg_dict: dict, mode: str, data_path: str, project_root: str) -> str:
-    """Run the SAM 2 semantics stage in a subprocess.
-
-    Args:
-        cfg_dict: Serialized OmegaConf config (plain dict for pickling)
-        mode: "video" or "photos"
-        data_path: Path to the video or photo directory
-        project_root: Project root directory
-
-    Returns:
-        Status message string
-    """
-    import gc
-    import torch
-    from omegaconf import OmegaConf
-    from src.semantic_engine import SemanticEngine
-
-    cfg = OmegaConf.create(cfg_dict)
-
-    engine = SemanticEngine(cfg)
-    # Override project root for subprocess context
-    engine.project_root = project_root
-
-    output_masks, frames_dir = engine.process_input(mode, data_path)
-    engine.save_outputs(output_masks, frames_dir)
-
-    # ─── MEMORY CLEANUP ─────────────────────────────────────────
-    engine.unload_all_models()
-    del engine, output_masks
-    gc.collect()
-    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
-
-    return "SUCCESS"
-
-
 # ─── Main Orchestrator ──────────────────────────────────────────────
 
 
 @hydra.main(version_base=None, config_path="./", config_name="config")
 def main(cfg: DictConfig):
-    """Run the complete semantic reconstruction pipeline.
+    pipeline_start = time.time()
 
-    Stages 1 and 2 are executed in parallel when possible.
-    Stage 3 (fusion) waits for both to complete.
-    """
     # ─── APPLY PRESET PROFILE ────────────────────────────────────
     cfg = apply_preset(cfg)
 
     print("=" * 70)
     print("MIRRA — SEMANTIC 3D RECONSTRUCTION PIPELINE")
     preset = cfg.get("preset", "default")
-    print(f"Mode: {preset.upper()} (VGGT + SAM 2 + TSDF)")
+    print(f"Mode: {preset.upper()} (DUSt3R + SAM 2 + TSDF)")
     print("=" * 70)
 
     project_root = (
@@ -210,106 +58,80 @@ def main(cfg: DictConfig):
         else os.getcwd()
     )
 
-    # ─── Detect input mode ────────────────────────────────────────────────
-    # Photo-dir mode: uses pre-captured wide-baseline photos (optimal for DUSt3R)
-    # Video mode: extracts frames from .mp4 at configured stride
-    use_photos = bool(cfg.dataset.get("photo_dir", ""))
-    if use_photos:
-        print(f"\n📷 Photo-folder mode: '{cfg.dataset.photo_dir}'")
+    # ─── DATA ROUTING (Photos vs Video) ──────────────────────────────────
+    mode, data_path = get_input_data(cfg, project_root)
+
+    if mode == "photos":
+        print(f"\n📷 Photo-folder mode detected: '{data_path}'")
+        print("   Skipping video extraction. Routing directly to DUSt3R.")
     else:
-        print("\n🎥 Video mode")
+        print(f"\n🎥 Video mode detected: '{data_path}'")
 
-    # ─── STAGE 1: GEOMETRY ───────────────────────────────────────────────
-    print("\n[1/3] Running Geometry Engine...")
+    # ─── STAGE 0: SHARED FRAME EXTRACTION ─────────────────────────────────
+    print("\n[0/3] Preparing frames...")
     try:
-        geo_engine = GeometryEngine(cfg)
-
-        if use_photos and geo_engine.has_photo_dir():
-            print(f"Loading photos from: {cfg.dataset.photo_dir}")
-            frames = geo_engine.load_photos_from_dir()
+        if mode == "photos":
+            frames, frames_dir = ingest_photos(data_path, cfg, project_root)
         else:
-            video_path = geo_engine._find_video()
-            print(f"Processing video: {video_path}")
-            frames = geo_engine.extract_frames(video_path)
+            frames, frames_dir = extract_frames(data_path, cfg, project_root)
 
         if not frames:
             print("❌ No frames prepared. Aborting.")
             sys.exit(1)
+
         print(f"✅ Prepared {len(frames)} frames in {frames_dir}")
     except Exception as e:
-        print(f"❌ Frame extraction failed: {e}")
+        print(f"❌ Frame preparation failed: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
-    # ─── STAGE 2: SEMANTICS ──────────────────────────────────────────────
-    print("\n[2/3] Running Semantic Engine...")
+    # ─── STAGE 1: GEOMETRY (DUSt3R) ─────────────────────────────────────
+    print("\n[1/3] Running Geometry Engine (DUSt3R)...")
+    try:
+        geo_engine = GeometryEngineV2(cfg)
+
+        # Run DUSt3R on the prepared frames
+        result = geo_engine.run_inference(frames)
+        geo_engine.save_outputs(result, frames)
+
+        # Free Memory
+        geo_engine.unload_model()
+        del geo_engine, result
+        _flush_mps_memory()
+        print("  🧹 DUSt3R fully unloaded, memory freed for SAM 2")
+
+    except Exception as e:
+        print(f"❌ Geometry stage failed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # ─── STAGE 2: SEMANTICS (SAM 2) ─────────────────────────────────────
+    # frames_dir was already populated in Stage 0 — SAM 2 reuses it directly.
+    print("\n[2/3] Running Semantic Engine (SAM 2)...")
     try:
         sem_engine = SemanticEngine(cfg)
+        output_masks, sem_frames_dir = sem_engine.process_input(mode, data_path)
+        sem_engine.save_outputs(output_masks, sem_frames_dir)
 
-        if use_photos and sem_engine.has_photo_dir():
-            # Photos already loaded into processed_frames_dir by GeometryEngine
-            frames_dir = sem_engine.get_photo_frames_dir()
-            output_masks, frames_dir = sem_engine.process_video_from_frames(frames_dir)
-        else:
-            video_path = sem_engine._find_video()
-            print(f"Processing video: {video_path}")
-            output_masks, frames_dir = sem_engine.process_video(video_path)
+        # Free Memory
+        sem_engine.unload_all_models()
+        del sem_engine, output_masks
+        _flush_mps_memory()
+        print("  🧹 SAM 2 fully unloaded, memory freed for TSDF")
 
-        sem_engine.save_outputs(output_masks, frames_dir)
-        print("✅ Semantics stage complete.")
     except Exception as e:
         print(f"❌ Semantics stage failed: {e}")
+        traceback.print_exc()
         sys.exit(1)
 
-    else:
-        # Serial mode (default) — runs one model at a time to save memory
-        print("\n[1/3] Running Geometry Engine (VGGT)...")
-        try:
-            from src.geometry_engine_v2 import GeometryEngineV2
-
-            geo_engine = GeometryEngineV2(cfg)
-            result = geo_engine.run_inference(frames)
-            geo_engine.save_outputs(result, frames)
-
-            # ─── FREE VGGT MODEL BEFORE LOADING SAM 2 ───────────
-            geo_engine.unload_model()
-            del geo_engine, result
-            _flush_mps_memory()
-            print("  🧹 VGGT fully unloaded, memory freed for SAM 2")
-
-        except Exception as e:
-            print(f"❌ Geometry stage failed: {e}")
-            traceback.print_exc()
-            sys.exit(1)
-
-        print("\n[2/3] Running Semantic Engine (SAM 2)...")
-        try:
-            from src.semantic_engine import SemanticEngine
-
-            sem_engine = SemanticEngine(cfg)
-            output_masks, frames_dir = sem_engine.process_input(mode, data_path)
-            sem_engine.save_outputs(output_masks, frames_dir)
-
-            # ─── FREE SAM 2 MODELS BEFORE FUSION ────────────────
-            sem_engine.unload_all_models()
-            del sem_engine, output_masks
-            _flush_mps_memory()
-            print("  🧹 SAM 2 fully unloaded, memory freed for TSDF")
-
-        except Exception as e:
-            print(f"❌ Semantics stage failed: {e}")
-            traceback.print_exc()
-            sys.exit(1)
-
-    # ─── STAGE 3: TSDF FUSION ────────────────────────────────────────
-    print("\n[3/3] Running Fusion Engine (TSDF + Denoiser + Semantic Vote)...")
+    # ─── STAGE 3: TSDF FUSION ──────────────────────────────────────────
+    print("\n[3/3] Running Fusion Engine (TSDF + Semantic Vote)...")
     try:
-        from src.fusion_engine import FusionEngine
-
         fusion_engine = FusionEngine(cfg)
         fusion_engine.run()
         print("✅ Fusion stage complete.")
 
-        # Final cleanup
+        # Free Memory
         del fusion_engine
         _flush_mps_memory()
 
@@ -318,7 +140,7 @@ def main(cfg: DictConfig):
         traceback.print_exc()
         sys.exit(1)
 
-    # ─── SUMMARY ─────────────────────────────────────────────────────
+    # ─── SUMMARY ───────────────────────────────────────────────────────
     elapsed = time.time() - pipeline_start
     final_dir = os.path.join(project_root, "outputs", "final")
 
@@ -326,13 +148,13 @@ def main(cfg: DictConfig):
     print(f"PIPELINE COMPLETE — {elapsed:.1f}s total ({preset} mode)")
     print("=" * 70)
     print("\nOutputs:")
-    print(f"  • Semantic Point Cloud: {final_dir}/semantic_world.ply")
-    print(f"  • Watertight Mesh:      {final_dir}/semantic_mesh.ply")
+    print(f"  • Semantic Point Cloud: {final_dir}/semantic_world_clean.ply")
     print(f"  • Label Map:            {final_dir}/label_map.json")
-    print(f"  • 3DGS Initialization:  {final_dir}/3dgs_init.npz")
-    print("\nView in MeshLab:")
-    print(f"  open {final_dir}/semantic_world.ply")
-    print(f"  open {final_dir}/semantic_mesh.ply")
+    print(f"  • Poses Archive:        outputs/geometry/poses.npz")
+    print("\nTo explore your world, run:")
+    print(
+        f"  uv run python tools/interactive_viewer.py {final_dir}/semantic_world_clean.ply"
+    )
     print()
 
 

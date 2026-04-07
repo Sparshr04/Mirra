@@ -1,55 +1,28 @@
 # ═══════════════════════════════════════════════════════════════════════
 # Mirra — Semantic 3D Reconstruction Pipeline
-# Architecture: VGGT-1B + SAM 2 + TSDF Volumetric Fusion
+# Architecture: DUSt3R + SAM 2 + TSDF Volumetric Fusion
 # ═══════════════════════════════════════════════════════════════════════
-#
-# ┌────────────────────────────────────────────────────────────────────┐
-# │ PRESET QUICK-REFERENCE TABLE                                      │
-# │                                                                   │
-# │  Lever                │  draft   │  default  │  high_quality      │
-# │  ─────────────────────┼──────────┼───────────┼──────────────────  │
-# │  stride               │  200     │  100      │  50                │
-# │  resolution           │  384     │  512      │  512               │
-# │  vggt_resolution      │  384     │  518      │  518               │
-# │  vggt_precision       │  bfloat16│  float32  │  float32           │
-# │  parallel_stages      │  false   │  false    │  true              │
-# │  keyframe_interval    │  20      │  10       │  5                 │
-# │  sam2_max_objects     │  15      │  30       │  50                │
-# │  tsdf.voxel_length    │  0.010   │  0.006    │  0.004             │
-# │  tsdf.sdf_trunc       │  0.050   │  0.030    │  0.020             │
-# │  tsdf.depth_trunc     │  3.0     │  5.0      │  10.0              │
-# │  enable_denoiser      │  false   │  true     │  true              │
-# └───────────────────────────────────────────────────────────────────┘
 #
 # Usage:
 #   uv run python main.py                        # uses 'default' preset
 #   uv run python main.py preset=draft           # fast/draft mode
 #   uv run python main.py preset=high_quality    # maximum quality
-#   uv run python main.py preset=draft stride=50 # override individual levers
 
-# Hardware / Compute
-device: "cuda" #cuda/cpu/mps
-
-# Reconstruction Parameters
-resolution: 256 #512
-stride: 45 #5
+# ─── Hardware / Compute ──────────────────────────────────────────────
+device: "mps"                   # Optimized for Apple Silicon M2
 
 # ─── Frame Extraction ────────────────────────────────────────────────
-resolution: 512                 # Resize extracted frames to NxN pixels
-stride: 100                    # Process every N-th video frame
+resolution: 1080                 # Resize extracted frames to NxN pixels
+stride: 5                   # Process every N-th video frame
 
-# ─── Geometry Backend (VGGT) ─────────────────────────────────────────
-geometry_backend: "vggt"        # "vggt" (recommended) or "dust3r" (legacy)
-vggt_resolution: 518            # Downscale frames before VGGT inference
-                                # (VGGT native is 518; lower = faster + less VRAM)
-vggt_precision: "float32"       # "float32" (max quality) or "bfloat16" (half memory)
-vggt_chunk_size: 4              # Frames per VGGT forward pass (lower = less VRAM)
-                                # ViT attention is O(S²); >5 frames OOMs on 8GB M2
+# ─── Geometry Backend (DUSt3R) ───────────────────────────────────────
+geometry_backend: "dust3r"      # Fully pivoted to DUSt3R for wide-baseline accuracy
+dust3r_batch_size: 2            # STRICTLY 1 to prevent MPS OOM crashes
+max_photos: 15                  # Hard cap for All-Pairs matching to protect RAM
 
 # ─── Pipeline Execution ─────────────────────────────────────────────
-parallel_stages: false          # Run geometry + semantics concurrently
-                                # ⚠️  Requires ~8GB+ unified memory (both models loaded)
-enable_denoiser: true           # Statistical + radius outlier removal on point cloud
+parallel_stages: false          # Run sequentially to protect unified memory
+enable_denoiser: false          # Statistical + radius outlier removal on point cloud
 
 # ─── Paths ───────────────────────────────────────────────────────────
 data:
@@ -66,22 +39,16 @@ checkpoints: "checkpoints"
 # ─── Semantics (SAM 2) ──────────────────────────────────────────────
 semantics:
   model_type: "sam2_hiera_large"
-  min_mask_region_area: 100 #50
+  min_mask_region_area: 100
   checkpoint_path: "checkpoints/sam2_hiera_large.pt"
   config_path: "sam2_hiera_l.yaml"
-  keyframe_interval: 10         # Auto-mask every N-th frame (multi-keyframe)
+  keyframe_interval: 10         # Auto-mask every N-th frame
   max_objects: 30               # Cap on tracked objects (OOM guard)
-
-depth_model:
-  type: "vggt"
 
 # ─── Unified Dataset Paths ──────────────────────────────────────────
 dataset:
   raw_video_dir: "data/raw"
-  photo_dir: ""  # Set to a directory of .jpg/.png photos for wide-baseline input
-                 # When set, the pipeline skips video extraction and uses these
-                 # photos directly. Ideal for DUSt3R's strength with unordered images.
-                 # Example: "data/raw/photos"
+  photo_dir: "data/raw/photos"  # Priority Photo Ingestion Directory
   processed_frames_dir: "data/processed/frames"
   video_filename: ""            # Leave empty to auto-detect newest video
   force_reprocess: false
@@ -91,6 +58,6 @@ resume: true                    # Cache inference outputs; skip on re-run
 
 # ─── TSDF Fusion Parameters ─────────────────────────────────────────
 tsdf:
-  voxel_length: 0.006           # Voxel resolution in meters (6mm default)
+  voxel_length: 0.002           # Voxel resolution in meters (6mm default)
   sdf_trunc: 0.030              # SDF truncation distance (5× voxel_length)
   depth_trunc: 5.0              # Maximum depth in meters to integrate

@@ -220,20 +220,25 @@ def _run_pipeline(job_id: str, video_filename: str) -> None:
 
     try:
         import torch
-        from src.video_utils import find_video, extract_frames
+        from src.video_utils import get_input_data, extract_frames, ingest_photos
         from src.geometry_engine_v2 import GeometryEngineV2
         from src.semantic_engine import SemanticEngine
         from src.fusion_engine import FusionEngine
 
         cfg = _build_cfg(video_filename)
 
-        # ── Stage 0: Shared frame extraction ───────────────────────────────
-        logger.info("[%s] Stage 0 – Frame extraction", job_id)
-        video_path = find_video(cfg, str(PROJECT_ROOT))
-        frames, frames_dir = extract_frames(video_path, cfg, str(PROJECT_ROOT))
+        # ── Stage 0: Shared frame extraction/ingestion ──────────────────
+        logger.info("[%s] Stage 0 – Frame extraction/ingestion", job_id)
+        mode, data_path = get_input_data(cfg, str(PROJECT_ROOT))
+        
+        if mode == "photos":
+            frames, frames_dir = ingest_photos(data_path, cfg, str(PROJECT_ROOT))
+        else:
+            frames, frames_dir = extract_frames(data_path, cfg, str(PROJECT_ROOT))
+            
         if not frames:
-            raise RuntimeError("No frames could be extracted from the video.")
-        logger.info("[%s] Extracted %d frames", job_id, len(frames))
+            raise RuntimeError("No frames could be prepared.")
+        logger.info("[%s] Prepared %d frames", job_id, len(frames))
 
         # ── Stage 1: Geometry (VGGT) ───────────────────────────────────────
         logger.info("[%s] Stage 1/3 – GeometryEngineV2 (VGGT)", job_id)
@@ -251,7 +256,7 @@ def _run_pipeline(job_id: str, video_filename: str) -> None:
         # ── Stage 2: Semantics (SAM 2 multi-keyframe) ──────────────────────
         logger.info("[%s] Stage 2/3 – SemanticEngine (multi-keyframe)", job_id)
         sem_engine = SemanticEngine(cfg)
-        output_masks, _ = sem_engine.process_video(video_path)
+        output_masks, _ = sem_engine.process_input(mode, data_path)
         sem_engine.save_outputs(output_masks, frames_dir)
         logger.info("[%s] Stage 2/3 – SemanticEngine DONE", job_id)
 
@@ -358,6 +363,71 @@ async def upload_video(file: UploadFile = File(...)) -> UploadResponse:
         size_bytes=file_size,
     )
 
+@app.post(
+    "/api/v1/upload/photos",
+    response_model=UploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload a directory of photos",
+    tags=["Pipeline"],
+)
+async def upload_photos(files: list[UploadFile] = File(...)) -> UploadResponse:
+    """
+    Accepts multiple photos.
+    Saves them to data/raw/images/.
+    Maximum 15 photos allowed per request to prevent OOM in DUSt3R all-pairs logic.
+    """
+    if len(files) > 15:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 15 photos allowed for high-accuracy 3D processing."
+        )
+
+    import shutil
+    ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+    images_dir = RAW_DIR / "images"
+    if images_dir.exists():
+        shutil.rmtree(images_dir)
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    total_size = 0
+    saved_files = []
+
+    for file in files:
+        original_name = Path(file.filename or "upload")
+        ext = original_name.suffix.lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            continue
+            
+        dest_path = images_dir / original_name.name
+        try:
+            async with aiofiles.open(dest_path, "wb") as out_file:
+                chunk_size = 1024 * 1024
+                while True:
+                    chunk = await file.read(chunk_size)
+                    if not chunk:
+                        break
+                    await out_file.write(chunk)
+            
+            total_size += dest_path.stat().st_size
+            saved_files.append(original_name.name)
+        except OSError as exc:
+            logger.exception("Failed to write uploaded photo.")
+            
+    if not saved_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid photos were uploaded."
+        )
+
+    logger.info("Uploaded %d photos to %s", len(saved_files), images_dir)
+
+    return UploadResponse(
+        filename="__photos_dir__",
+        url="/files/raw/images",
+        size_bytes=total_size,
+    )
+
 
 @app.post(
     "/api/v1/process",
@@ -377,16 +447,23 @@ async def process_video(
     Returns a `job_id` UUID immediately (HTTP 202 Accepted).
     The caller should poll `GET /api/v1/status/{job_id}` for updates.
     """
-    video_path = RAW_DIR / body.filename
-
-    if not video_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                f"Video '{body.filename}' not found in data/raw/. "
-                "Upload it first via POST /api/v1/upload."
-            ),
-        )
+    if body.filename == "__photos_dir__":
+        video_path = RAW_DIR / "images"
+        if not video_path.is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Photo directory 'data/raw/images/' not found. Upload photos first."
+            )
+    else:
+        video_path = RAW_DIR / body.filename
+        if not video_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(
+                    f"Video '{body.filename}' not found in data/raw/. "
+                    "Upload it first via POST /api/v1/upload."
+                ),
+            )
 
     job_id = str(uuid.uuid4())
 

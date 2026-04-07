@@ -7,7 +7,7 @@
 [![React](https://img.shields.io/badge/React-20232A?style=flat&logo=react&logoColor=61DAFB)](https://react.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Hackathon Winner](https://img.shields.io/badge/%F0%9F%8F%86-Hackathon%20Winner-gold.svg)]()
+
 
 A state-of-the-art pipeline extracting real-world video into metric-semantic 3D environments using DUSt3R geometry and SAM 2 segmentation.
 
@@ -17,53 +17,37 @@ A state-of-the-art pipeline extracting real-world video into metric-semantic 3D 
 
 ## Visual Results
 
-<table align="center" width="100%">
+<table align="center">
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom with semantic.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/classroom_with_semantic.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/classroom without semantic vedio.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/classroom_without_semantic_video.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/heatmap_flythrough .mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough_building.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/classroom/non_semantic_flythrough .mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="assets/semantic_flythrough_building.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/heatmap_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/heatmap_flythrough_corridor.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
   <tr>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/non_semantic_flythrough.mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough_corridor.gif" width="400"/>
     </td>
-    <td width="50%">
-      <video autoplay loop muted playsinline width="100%">
-        <source src="frontend/assets/coridoor 2/semantic_flythrough .mp4" type="video/mp4">
-      </video>
+    <td align="center">
+      <img src="./assets/non_semantic_flythrough.gif" width="400"/>
     </td>
   </tr>
 </table>
@@ -83,6 +67,9 @@ Powered by `uv` for seamless dependency resolution.
 pip install uv
 uv sync
 
+# For AMD ROCm/HIP acceleration (ROCm 6.1):
+# uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.1
+
 # Run the REST API
 uv run uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -91,8 +78,13 @@ uv run uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
 Powered by `bun` for blazingly fast execution.
 ```bash
 cd frontend
+
 bun install
-bun run dev
+bun run start
+
+# Or you can always use
+npm install
+npm start
 ```
 
 ## Repository Structure
@@ -112,3 +104,20 @@ bun run dev
     ├── geometry_engine.py   # DUSt3R depth and pose estimation
     └── semantic_engine.py   # SAM 2 video segmentation
 ```
+
+## Third-Party Dependencies
+
+Mirra uses the following open-source projects:
+
+- DUSt3R — Licensed under
+- Segment Anything (Meta)
+
+These projects remain under their respective licenses.
+Mirra does not claim ownership of these components.
+Mirra is licensed under MIT.
+
+Mirra depends on DUSt3R (CC BY-NC-SA 4.0),
+which restricts commercial usage.
+
+Users are responsible for complying with DUSt3R's license.
+

@@ -182,13 +182,17 @@ class SemanticEngine:
             print(f"Error loading SAM 2 models: {e}")
             raise e
 
-        # Multi-keyframe interval (every N-th frame gets auto-masking)
-        self.keyframe_interval = cfg.semantics.get("keyframe_interval", 10)
-        print(f"  Keyframe interval: every {self.keyframe_interval} frames")
-
-        # Max objects cap (OOM guard)
-        self.max_objects = cfg.semantics.get("max_objects", 30)
-        print(f"  Max objects cap: {self.max_objects}")
+    def _get_device(self):
+        if torch.cuda.is_available():
+            if getattr(torch.version, "hip", None) is not None:
+                print(
+                    "AMD ROCm / HIP detected. Utilizing AMD Instinct/Radeon acceleration."
+                )
+            return "cuda"
+        elif torch.backends.mps.is_available() and self.cfg.device == "mps":
+            return "mps"
+        else:
+            return "cpu"
 
     def _download_checkpoint(self):
         if not os.path.exists(self.checkpoint_path):
@@ -201,10 +205,65 @@ class SemanticEngine:
                 print(f"Failed to download checkpoint: {e}")
                 sys.exit(1)
 
-    def _detect_objects_on_frame(
-        self, frame_rgb: np.ndarray, min_area: int
-    ) -> list[dict]:
-        """Run SAM2AutomaticMaskGenerator on a single frame.
+    def has_photo_dir(self):
+        """Check if a photo directory is configured and exists."""
+        photo_dir = self.cfg.dataset.get("photo_dir", "")
+        if not photo_dir:
+            return False
+        abs_photo_dir = os.path.join(self.project_root, photo_dir)
+        return os.path.isdir(abs_photo_dir)
+
+    def get_photo_frames_dir(self):
+        """Return the processed frames directory (already populated by GeometryEngine).
+
+        When using photo-dir input, GeometryEngine has already copied and
+        resized the photos into processed_frames_dir. We just return that
+        path for SAM 2 to consume.
+        """
+        frames_dir = os.path.join(
+            self.project_root, self.cfg.dataset.processed_frames_dir
+        )
+        if not os.path.exists(frames_dir):
+            raise FileNotFoundError(
+                f"Processed frames not found at {frames_dir}. "
+                f"Run GeometryEngine first to populate frames from photo_dir."
+            )
+
+        existing = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
+        if not existing:
+            raise FileNotFoundError(
+                f"No .jpg frames found in {frames_dir}. "
+                f"GeometryEngine should have placed them there."
+            )
+
+        print(f"Using {len(existing)} pre-loaded photo frames from {frames_dir}")
+        return frames_dir
+
+    def _find_video(self):
+        """
+        Locate the input video using the unified dataset config.
+        Uses glob to auto-detect the first video if no specific filename is set.
+        """
+        raw_dir = os.path.join(self.project_root, self.cfg.dataset.raw_video_dir)
+        if not os.path.exists(raw_dir):
+            raise FileNotFoundError(f"Raw video directory not found: {raw_dir}")
+
+        # Check for a specific filename first
+        video_filename = self.cfg.dataset.get("video_filename", "")
+        if video_filename:
+            video_path = os.path.join(raw_dir, video_filename)
+            if os.path.exists(video_path):
+                return video_path
+            print(
+                f"Warning: Specified video '{video_filename}' not found, auto-detecting..."
+            )
+
+        # Auto-detect first video file
+        patterns = ["*.mp4", "*.mov", "*.avi", "*.mkv"]
+        for pattern in patterns:
+            matches = sorted(glob.glob(os.path.join(raw_dir, pattern)))
+            if matches:
+                return matches[0]
 
         Returns filtered masks sorted by area (largest first).
         """
@@ -302,105 +361,96 @@ class SemanticEngine:
 
             output_masks = {}
 
-            # 3. Process each keyframe
-            for kf_idx in keyframe_indices:
-                # Check max objects cap (OOM guard)
-                if (next_obj_id - 1) >= self.max_objects:
-                    print(
-                        f"  ⚠️  Max objects cap reached ({self.max_objects}). "
-                        f"Skipping remaining keyframes."
-                    )
-                    break
+            frame_idx += 1
 
-                frame_path = os.path.join(frames_dir, frame_names[kf_idx])
-                image = cv2.imread(frame_path)
-                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        cap.release()
+        extracted = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+        print(f"Frame extraction complete. {extracted} frames saved to {frames_dir}.")
 
-                print(f"\n[Keyframe {kf_idx}] Running auto-mask generation...")
-                new_masks = self._detect_objects_on_frame(image_rgb, min_area)
-                print(f"  Detected {len(new_masks)} objects (area > {min_area})")
+        # Write metadata for future cache validation
+        self._save_frame_metadata(frames_dir, video_path, extracted)
+        return frames_dir
 
-                existing_at_kf = {}
-                if kf_idx in output_masks:
-                    existing_at_kf = output_masks[kf_idx]
+    def process_video_from_frames(self, frames_dir):
+        """Process pre-existing frames directory (for photo-dir mode).
 
-                new_count = 0
-                for detection in new_masks:
-                    # Enforce max objects cap
-                    if (next_obj_id - 1) >= self.max_objects:
-                        print(
-                            f"  ⚠️  Max objects cap ({self.max_objects}) reached "
-                            f"during keyframe {kf_idx}. Stopping detection."
-                        )
-                        break
+        Identical to process_video() but skips frame extraction since
+        the frames are already in frames_dir (placed by GeometryEngine).
+        """
+        return self._run_segmentation(frames_dir)
 
-                    det_mask = detection["segmentation"].astype(np.bool_)
+    def process_video(self, video_path):
+        # 1. Prepare Frames
+        frames_dir = self.extract_frames(video_path)
+        # 2. Run segmentation on extracted frames
+        return self._run_segmentation(frames_dir)
 
-                    is_novel = True
-                    for eid, emask in existing_at_kf.items():
-                        if emask.ndim == 3:
-                            emask = emask[0]
-                        iou = self._compute_iou(det_mask, emask)
-                        if iou > IOU_MATCH_THRESHOLD:
-                            is_novel = False
-                            break
+    def _run_segmentation(self, frames_dir):
+        """Core segmentation logic: auto-prompt Frame 0, propagate through all frames.
 
-                    if is_novel:
-                        obj_id = next_obj_id
-                        next_obj_id += 1
-                        active_obj_ids.add(obj_id)
+        Args:
+            frames_dir: Directory containing sequential JPEG frames.
 
-                        _, out_obj_ids, out_mask_logits = (
-                            self.video_predictor.add_new_mask(
-                                inference_state=inference_state,
-                                frame_idx=kf_idx,
-                                obj_id=obj_id,
-                                mask=det_mask,
-                            )
-                        )
-                        new_count += 1
+        Returns:
+            (output_masks, frames_dir) tuple where output_masks is
+            {frame_idx: {obj_id: (H, W) bool mask}}.
+        """
+        # 1. Initialize Video State
+        inference_state = self.video_predictor.init_state(video_path=frames_dir)
 
-                print(
-                    f"  Registered {new_count} new objects (total: {next_obj_id - 1})"
+        # 2. Auto-Prompt Frame 0
+        print("Generating automatic masks for Frame 0...")
+        frame_names = sorted(
+            [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
+        )
+        frame0_path = os.path.join(frames_dir, frame_names[0])
+        image0 = cv2.imread(frame0_path)
+        image0 = cv2.cvtColor(image0, cv2.COLOR_BGR2RGB)
+
+        masks0 = self.mask_generator.generate(image0)
+        print(f"Found {len(masks0)} objects in Frame 0.")
+
+        # Filter tiny masks
+        min_area = self.cfg.semantics.min_mask_region_area
+        masks0 = [m for m in masks0 if m["area"] > min_area]
+        print(f"Kept {len(masks0)} objects after filtering (area > {min_area}).")
+
+        output_masks = {}
+
+        # 3. Add Prompts to Video Predictor
+        final_out_obj_ids = []
+        final_out_mask_logits = []
+
+        for i, mask_data in enumerate(masks0):
+            mask = mask_data["segmentation"].astype(np.bool_)
+            obj_id = i + 1
+
+            _, final_out_obj_ids, final_out_mask_logits = (
+                self.video_predictor.add_new_mask(
+                    inference_state=inference_state,
+                    frame_idx=0,
+                    obj_id=obj_id,
+                    mask=mask,
                 )
 
-                # Flush MPS cache after each keyframe's heavy auto-mask work
-                _flush_mps_memory()
+        # Save Frame 0 results
+        if len(masks0) > 0:
+            output_masks[0] = {
+                obj_id: (final_out_mask_logits[i] > 0.0).cpu().numpy()
+                for i, obj_id in enumerate(final_out_obj_ids)
+            }
 
-            # ─── FREE IMAGE MODEL BEFORE PROPAGATION ─────────────────
-            # The image_model and mask_generator are only needed for
-            # keyframe auto-masking. Free them before the memory-hungry
-            # video propagation phase.
-            self._free_image_model()
-
-            # 4. Propagate through entire video
-            print("\nPropagating all masks through video...")
-            prop_count = 0
-            for (
-                out_frame_idx,
-                out_obj_ids,
-                out_mask_logits,
-            ) in self.video_predictor.propagate_in_video(inference_state):
-                output_masks[out_frame_idx] = {
-                    obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                    for i, obj_id in enumerate(out_obj_ids)
-                }
-                prop_count += 1
-
-                # Periodic MPS cache flush during propagation
-                # (every 50 frames to avoid cache buildup)
-                if prop_count % 50 == 0:
-                    _flush_mps_memory()
-
-        # Context manager ends here. Final cleanup.
-        _flush_mps_memory()
-
-        total_objects = next_obj_id - 1
-        frames_with_masks = len(output_masks)
-        print(
-            f"\n✅ Segmentation complete: {total_objects} objects "
-            f"tracked across {frames_with_masks} frames"
-        )
+        # 4. Propagate
+        print("Propagating masks through video...")
+        for (
+            out_frame_idx,
+            out_obj_ids,
+            out_mask_logits,
+        ) in self.video_predictor.propagate_in_video(inference_state):
+            output_masks[out_frame_idx] = {
+                obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                for i, obj_id in enumerate(out_obj_ids)
+            }
 
         return output_masks, frames_dir
 

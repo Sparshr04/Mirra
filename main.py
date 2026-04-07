@@ -210,19 +210,28 @@ def main(cfg: DictConfig):
         else os.getcwd()
     )
 
-    pipeline_start = time.time()
+    # ─── Detect input mode ────────────────────────────────────────────────
+    # Photo-dir mode: uses pre-captured wide-baseline photos (optimal for DUSt3R)
+    # Video mode: extracts frames from .mp4 at configured stride
+    use_photos = bool(cfg.dataset.get("photo_dir", ""))
+    if use_photos:
+        print(f"\n📷 Photo-folder mode: '{cfg.dataset.photo_dir}'")
+    else:
+        print("\n🎥 Video mode")
 
-    # ─── STAGE 0: SHARED FRAME EXTRACTION/INGESTION ──────────────────
-    print("\n[0/3] Preparing frames (shared by both engines)...")
+    # ─── STAGE 1: GEOMETRY ───────────────────────────────────────────────
+    print("\n[1/3] Running Geometry Engine...")
     try:
-        mode, data_path = get_input_data(cfg, project_root)
-        if mode == "photos":
-            print(f"Processing photo directory: {data_path}")
-            frames, frames_dir = ingest_photos(data_path, cfg, project_root)
+        geo_engine = GeometryEngine(cfg)
+
+        if use_photos and geo_engine.has_photo_dir():
+            print(f"Loading photos from: {cfg.dataset.photo_dir}")
+            frames = geo_engine.load_photos_from_dir()
         else:
-            print(f"Processing video: {data_path}")
-            frames, frames_dir = extract_frames(data_path, cfg, project_root)
-            
+            video_path = geo_engine._find_video()
+            print(f"Processing video: {video_path}")
+            frames = geo_engine.extract_frames(video_path)
+
         if not frames:
             print("❌ No frames prepared. Aborting.")
             sys.exit(1)
@@ -231,49 +240,25 @@ def main(cfg: DictConfig):
         print(f"❌ Frame extraction failed: {e}")
         sys.exit(1)
 
-    # ─── STAGE 1 + 2: PARALLEL GEOMETRY + SEMANTICS ─────────────────
-    parallel = cfg.get("parallel_stages", False)
+    # ─── STAGE 2: SEMANTICS ──────────────────────────────────────────────
+    print("\n[2/3] Running Semantic Engine...")
+    try:
+        sem_engine = SemanticEngine(cfg)
 
-    if parallel:
-        print("\n[1+2/3] Running Geometry + Semantics in PARALLEL...")
-        print("  ⚠️  Requires ~8GB+ unified memory (both models loaded)")
+        if use_photos and sem_engine.has_photo_dir():
+            # Photos already loaded into processed_frames_dir by GeometryEngine
+            frames_dir = sem_engine.get_photo_frames_dir()
+            output_masks, frames_dir = sem_engine.process_video_from_frames(frames_dir)
+        else:
+            video_path = sem_engine._find_video()
+            print(f"Processing video: {video_path}")
+            output_masks, frames_dir = sem_engine.process_video(video_path)
 
-        # Convert cfg to a plain dict for pickling across processes
-        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
-
-        geo_status = None
-        sem_status = None
-
-        # Use ProcessPoolExecutor for true parallelism (GIL bypass)
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            future_geo = executor.submit(
-                _run_geometry, cfg_dict, mode, data_path, project_root
-            )
-            future_sem = executor.submit(
-                _run_semantics, cfg_dict, mode, data_path, project_root
-            )
-
-            for future in as_completed([future_geo, future_sem]):
-                try:
-                    result = future.result()
-                    if future == future_geo:
-                        geo_status = result
-                        print(f"  ✅ Geometry stage: {result}")
-                    else:
-                        sem_status = result
-                        print(f"  ✅ Semantics stage: {result}")
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    if future == future_geo:
-                        geo_status = f"FAILED: {e}"
-                        print(f"  ❌ Geometry stage failed:\n{tb}")
-                    else:
-                        sem_status = f"FAILED: {e}"
-                        print(f"  ❌ Semantics stage failed:\n{tb}")
-
-        if "FAILED" in str(geo_status) or "FAILED" in str(sem_status):
-            print("❌ One or more parallel stages failed. Aborting fusion.")
-            sys.exit(1)
+        sem_engine.save_outputs(output_masks, frames_dir)
+        print("✅ Semantics stage complete.")
+    except Exception as e:
+        print(f"❌ Semantics stage failed: {e}")
+        sys.exit(1)
 
     else:
         # Serial mode (default) — runs one model at a time to save memory

@@ -27,13 +27,12 @@
 #   uv run python main.py preset=high_quality    # maximum quality
 #   uv run python main.py preset=draft stride=50 # override individual levers
 
-# ─── Preset Selection ────────────────────────────────────────────────
-# One of: "draft", "default", "high_quality"
-# Individual values below can override the preset.
-preset: "default"
+# Hardware / Compute
+device: "cuda" #cuda/cpu/mps
 
-# ─── Hardware / Compute ──────────────────────────────────────────────
-device: "mps"                   # cuda / cpu / mps
+# Reconstruction Parameters
+resolution: 256 #512
+stride: 45 #5
 
 # ─── Frame Extraction ────────────────────────────────────────────────
 resolution: 512                 # Resize extracted frames to NxN pixels
@@ -56,7 +55,7 @@ enable_denoiser: true           # Statistical + radius outlier removal on point 
 data:
   raw: "data/raw"
   processed: "data/processed"
-
+  
 outputs:
   geometry: "outputs/geometry"
   semantics: "outputs/semantics"
@@ -67,7 +66,7 @@ checkpoints: "checkpoints"
 # ─── Semantics (SAM 2) ──────────────────────────────────────────────
 semantics:
   model_type: "sam2_hiera_large"
-  min_mask_region_area: 100
+  min_mask_region_area: 100 #50
   checkpoint_path: "checkpoints/sam2_hiera_large.pt"
   config_path: "sam2_hiera_l.yaml"
   keyframe_interval: 10         # Auto-mask every N-th frame (multi-keyframe)
@@ -79,6 +78,10 @@ depth_model:
 # ─── Unified Dataset Paths ──────────────────────────────────────────
 dataset:
   raw_video_dir: "data/raw"
+  photo_dir: ""  # Set to a directory of .jpg/.png photos for wide-baseline input
+                 # When set, the pipeline skips video extraction and uses these
+                 # photos directly. Ideal for DUSt3R's strength with unordered images.
+                 # Example: "data/raw/photos"
   processed_frames_dir: "data/processed/frames"
   video_filename: ""            # Leave empty to auto-detect newest video
   force_reprocess: false

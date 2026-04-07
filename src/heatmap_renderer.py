@@ -156,7 +156,19 @@ def render_flythrough(pcd, interp_c2w, interp_focals, output_path):
         RENDER_HEIGHT / 2.0,
     )
 
-    focal_scale = RENDER_WIDTH / 256.0
+    # Read source resolution from poses metadata for correct focal scaling
+    _poses_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "outputs", "geometry", "poses.npz",
+    )
+    source_res = 256  # fallback for legacy DUSt3R outputs
+    if os.path.exists(_poses_path):
+        _poses_data = np.load(_poses_path, allow_pickle=True)
+        if "source_resolution" in _poses_data:
+            source_res = int(_poses_data["source_resolution"][1])
+        elif "image_shapes" in _poses_data:
+            source_res = int(_poses_data["image_shapes"][0, 1])
+    focal_scale = RENDER_WIDTH / float(source_res)
 
     for i in range(total_frames):
         scaled_focal = interp_focals[i] * focal_scale

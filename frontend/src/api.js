@@ -30,6 +30,30 @@ export async function uploadVideo(file) {
 }
 
 /**
+ * Upload multiple photo files to the backend.
+ * @param {File[]} files - Array of photo files (jpg, png)
+ * @returns {Promise<{filename: string, url: string, size_bytes: number}>}
+ */
+export async function uploadPhotos(files) {
+    const form = new FormData();
+    for (const file of files) {
+        form.append("files", file);
+    }
+
+    const res = await fetch(`${BASE_URL}/api/v1/upload/photos`, {
+        method: "POST",
+        body: form,
+    });
+
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || "Photo upload failed");
+    }
+
+    return res.json();
+}
+
+/**
  * Enqueue the ML processing pipeline for an uploaded video.
  * @param {string} filename - The unique filename returned by uploadVideo()
  * @returns {Promise<{job_id: string, status: string, message: string}>}

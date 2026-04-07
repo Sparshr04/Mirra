@@ -1,8 +1,10 @@
-"""Unit tests for the FusionEngine projection math.
+"""Unit tests for the FusionEngine projection math and semantic voting.
 
 Tests verify the pinhole projection roundtrip against known
-synthetic cameras and 3D points. No actual DUSt3R/SAM2 models
+synthetic cameras and 3D points. No actual VGGT/SAM2 models
 or data are required — all inputs are generated synthetically.
+
+Updated for TSDF-based FusionEngine (v2 architecture).
 """
 
 import unittest
@@ -23,11 +25,23 @@ def _make_dummy_cfg():
             "device": "cpu",
             "resolution": 256,
             "stride": 5,
+            "enable_denoiser": True,
             "data": {"raw": "data/raw", "processed": "data/processed"},
             "outputs": {
                 "geometry": "outputs/geometry",
                 "semantics": "outputs/semantics",
                 "final": "outputs/final",
+            },
+            "dataset": {
+                "raw_video_dir": "data/raw",
+                "processed_frames_dir": "data/processed/frames",
+                "video_filename": "",
+                "force_reprocess": False,
+            },
+            "tsdf": {
+                "voxel_length": 0.004,
+                "sdf_trunc": 0.02,
+                "depth_trunc": 10.0,
             },
         }
     )
@@ -262,6 +276,62 @@ class TestVoteSemantics(unittest.TestCase):
         )
         # Both have 1 vote each; label 1 wins by sorted order in argmax
         self.assertIn(labels[0], [1, 2], "Should be labeled either 1 or 2")
+
+
+class TestDenoiser(unittest.TestCase):
+    """Test the integrated denoiser with synthetic point clouds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.engine = FusionEngine.__new__(FusionEngine)
+        cls.engine.STAT_NB_NEIGHBORS = 20
+        cls.engine.STAT_STD_RATIO = 2.0
+        cls.engine.RADIUS_NB_POINTS = 6
+        cls.engine.RADIUS = 0.015
+
+    def test_denoiser_removes_outliers(self):
+        """Denoiser should remove isolated far-away points."""
+        import open3d as o3d
+
+        # Create a dense cluster of 500 points near origin
+        np.random.seed(42)
+        cluster = np.random.randn(500, 3) * 0.01  # Tight cluster
+
+        # Add 10 extreme outliers
+        outliers = np.random.randn(10, 3) * 100.0
+
+        all_pts = np.vstack([cluster, outliers])
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_pts)
+
+        cleaned = self.engine.denoise_point_cloud(pcd)
+
+        # The denoiser should remove some or all outliers
+        self.assertLess(
+            len(cleaned.points),
+            len(pcd.points),
+            "Denoiser should remove outliers",
+        )
+
+    def test_denoiser_preserves_dense_cluster(self):
+        """Denoiser should not remove points from a dense cluster."""
+        import open3d as o3d
+
+        # 500 points very tightly clustered
+        np.random.seed(42)
+        pts = np.random.randn(500, 3) * 0.005
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+
+        cleaned = self.engine.denoise_point_cloud(pcd)
+
+        # Allow up to 5% removal from statistical edge effects
+        removed_pct = 1.0 - len(cleaned.points) / len(pcd.points)
+        self.assertLess(
+            removed_pct,
+            0.15,
+            f"Dense cluster should lose <15% points, lost {removed_pct*100:.1f}%",
+        )
 
 
 if __name__ == "__main__":

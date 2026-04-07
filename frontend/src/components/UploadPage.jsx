@@ -1,5 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
-import { uploadVideo, processVideo, pollStatus, listPlyFiles, BASE_URL } from "../api";
+import { uploadVideo, processVideo, pollStatus, listPlyFiles, BASE_URL, uploadPhotos } from "../api";
 
 /* ─────────────────────────────────────────────────────────────
    CSS — matches Mirra HeroPage design system exactly
@@ -738,7 +737,7 @@ export default function UploadPage({ setPage, onComplete }) {
   const fileInputRef = useRef(null);
   const pollRef = useRef(null);
 
-  const [file, setFile] = useState(null);
+  const [selectedInputs, setSelectedInputs] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -765,12 +764,21 @@ export default function UploadPage({ setPage, onComplete }) {
   useEffect(() => { refreshFiles(); }, [refreshFiles]);
 
   /* ── Drag / file pick ────────────────────────── */
-  const pickFile = useCallback((f) => { if (f) setFile(f); }, []);
-  const clearFile = useCallback((e) => { e.stopPropagation(); setFile(null); }, []);
+  const pickFiles = useCallback((fList) => {
+    if (!fList || fList.length === 0) return;
+    const arr = Array.from(fList);
+    if (arr.length > 15) {
+      setErrMsg("Maximum 15 photos allowed for high-accuracy 3D processing.");
+      setPhase("ERROR");
+      return;
+    }
+    setSelectedInputs(arr);
+  }, []);
+  const clearFile = useCallback((e) => { e.stopPropagation(); setSelectedInputs([]); }, []);
   const onDrop = useCallback((e) => {
     e.preventDefault(); setDragOver(false);
-    pickFile(e.dataTransfer.files[0]);
-  }, [pickFile]);
+    pickFiles(e.dataTransfer.files);
+  }, [pickFiles]);
 
   /* ── Open existing scene ─────────────────────── */
   const openScene = useCallback((f) => {
@@ -824,7 +832,7 @@ export default function UploadPage({ setPage, onComplete }) {
 
   /* ── Main launch handler ─────────────────────── */
   const handleLaunch = useCallback(async () => {
-    if (!file) return;
+    if (selectedInputs.length === 0) return;
     setPhase("UPLOADING");
     setStageIdx(0);
     setErrMsg(null);
@@ -832,7 +840,11 @@ export default function UploadPage({ setPage, onComplete }) {
 
     try {
       /* 1. Upload */
-      const uploadData = await uploadVideo(file);
+      const isPhotos = selectedInputs.length > 1 || selectedInputs[0].type.startsWith("image/");
+      const uploadData = isPhotos 
+        ? await uploadPhotos(selectedInputs) 
+        : await uploadVideo(selectedInputs[0]);
+        
       setStageIdx(1);
       setPhase("PROCESSING");
 
@@ -859,14 +871,15 @@ export default function UploadPage({ setPage, onComplete }) {
     setJobId(null);
     setJobResult(null);
     setErrMsg(null);
-    setFile(null);
+    setSelectedInputs([]);
     stopPoll();
   }, [stopPoll]);
 
   /* ── Progress % ──────────────────────────────── */
   const progress = Math.round((stageIdx / (PROC_STAGES.length - 1)) * 100);
 
-  const dzClass = ["dz-card", dragOver ? "drag-over" : "", file ? "has-file" : ""].filter(Boolean).join(" ");
+  const hasFiles = selectedInputs.length > 0;
+  const dzClass = ["dz-card", dragOver ? "drag-over" : "", hasFiles ? "has-file" : ""].filter(Boolean).join(" ");
   const isRunning = phase === "UPLOADING" || phase === "PROCESSING" || phase === "DONE";
 
   return (
@@ -985,9 +998,10 @@ export default function UploadPage({ setPage, onComplete }) {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".mp4,.mov,.avi,.mkv,video/*"
+              multiple
+              accept=".mp4,.mov,.avi,.mkv,video/*,image/jpeg,image/png,image/*"
               style={{ display: "none" }}
-              onChange={(e) => pickFile(e.target.files[0])}
+              onChange={(e) => pickFiles(e.target.files)}
             />
 
             {/* ── Drop zone ── */}
@@ -1011,7 +1025,7 @@ export default function UploadPage({ setPage, onComplete }) {
                   <div className="dz-orbit-ring" />
                   <div className="dz-icon-box">
                     <span className="dz-icon">
-                      {file ? "✓"
+                      {hasFiles ? "✓"
                         : dragOver ? "↓"
                           : "⬆"}
                     </span>
@@ -1019,33 +1033,35 @@ export default function UploadPage({ setPage, onComplete }) {
                 </div>
 
                 <div className="dz-heading">
-                  {file ? "Video ready to process"
+                  {hasFiles ? `${selectedInputs.length} file(s) ready to process`
                     : dragOver ? "Release to upload"
-                      : "Drop video file here"}
+                      : "Drop video or photos here"}
                 </div>
                 <div className="dz-hint">
-                  {file ? "Click to swap file" : "or click to browse"}
+                  {hasFiles ? "Click to swap files" : "or click to browse"}
                 </div>
 
                 {/* format chips */}
-                {!file && (
+                {!hasFiles && (
                   <div className="dz-formats">
-                    {["MP4", "MOV", "AVI", "MKV", "Max 2GB"].map(f => (
+                    {["MP4", "MOV", "JPG", "PNG", "Max 2GB"].map(f => (
                       <span key={f} className="fmt-tag">{f}</span>
                     ))}
                   </div>
                 )}
 
                 {/* selected file chip */}
-                {file && (
+                {hasFiles && (
                   <div
                     className="dz-file-chip"
                     onClick={(e) => e.stopPropagation()}
                   >
                     <div className="dz-file-chip-dot" />
-                    <span className="dz-file-chip-name">{file.name}</span>
-                    {file.size && (
-                      <span className="dz-file-chip-size">{fmtBytes(file.size)}</span>
+                    <span className="dz-file-chip-name">
+                      {selectedInputs.length === 1 ? selectedInputs[0].name : `${selectedInputs.length} images selected`}
+                    </span>
+                    {selectedInputs.length === 1 && selectedInputs[0].size && (
+                      <span className="dz-file-chip-size">{fmtBytes(selectedInputs[0].size)}</span>
                     )}
                     <button className="dz-file-chip-x" onClick={clearFile} title="Remove file">
                       ✕
@@ -1072,7 +1088,7 @@ export default function UploadPage({ setPage, onComplete }) {
             </div>
 
             {/* ── Launch button (only when file selected) ── */}
-            {file && (
+            {hasFiles && (
               <button className="btn-launch" onClick={handleLaunch}>
                 <div className="btn-launch-left">
                   <span className="btn-launch-label">Run Mirra Pipeline</span>

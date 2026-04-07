@@ -241,12 +241,26 @@ def render_flythrough(
         cy=RENDER_HEIGHT / 2.0,
     )
 
+    # Read source resolution from poses metadata for correct focal scaling
+    poses_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "outputs", "geometry", "poses.npz",
+    )
+    source_res = 256  # fallback for legacy DUSt3R outputs
+    if os.path.exists(poses_path):
+        _poses_data = np.load(poses_path, allow_pickle=True)
+        if "source_resolution" in _poses_data:
+            source_res = int(_poses_data["source_resolution"][1])  # width
+            print(f"  Using source resolution from poses: {source_res}px")
+        elif "image_shapes" in _poses_data:
+            source_res = int(_poses_data["image_shapes"][0, 1])
+            print(f"  Using image_shapes width from poses: {source_res}px")
+
     # ── Render loop ──────────────────────────────────────────────
     frames_written = 0
     for i in range(total_frames):
-        # Compute focal for this frame (scale from DUSt3R res to render res)
-        # DUSt3R focal is for 256px images; scale to RENDER_WIDTH
-        focal_scale = RENDER_WIDTH / 256.0  # Adjust if DUSt3R used different res
+        # Scale focal from source resolution to render resolution
+        focal_scale = RENDER_WIDTH / float(source_res)
         scaled_focal = interp_focals[i] * focal_scale
 
         # Update intrinsics for this frame's focal length

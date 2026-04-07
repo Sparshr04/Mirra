@@ -1,3 +1,4 @@
+import { useState, useRef, useCallback, useEffect } from "react";
 import { uploadVideo, processVideo, pollStatus, listPlyFiles, BASE_URL, uploadPhotos } from "../api";
 
 /* ─────────────────────────────────────────────────────────────
@@ -862,7 +863,7 @@ export default function UploadPage({ setPage, onComplete }) {
       setErrMsg(e.message || "An unexpected error occurred.");
       setPhase("ERROR");
     }
-  }, [file, startPolling, stopPoll]);
+  }, [selectedInputs, startPolling, stopPoll]);
 
   /* ── Retry (reset to IDLE) ───────────────────── */
   const handleRetry = useCallback(() => {

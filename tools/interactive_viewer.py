@@ -1,173 +1,480 @@
 #!/usr/bin/env python3
 """
-Interactive 3D Point Cloud Viewer — Free-Flight Navigation.
+Mirra Interactive Semantic Viewer — First-Person Open-World Explorer.
 
-A standalone FPS-style viewer for exploring semantic point clouds using
-keyboard and mouse controls. Built on Open3D's VisualizerWithKeyCallback.
+Navigate a semantic point cloud like a video game. Walk with WASD, look
+with arrow keys and mouse orbit, and identify objects via a center-screen
+ray that highlights the targeted semantic object.
+
+Built on Open3D's VisualizerWithKeyCallback with custom extrinsic matrix
+manipulation for true FPS camera control.
 
 ══════════════════════════════════════════════════════════════════════
   CONTROLS
 ══════════════════════════════════════════════════════════════════════
-  Movement:
-    W / S           — Move forward / backward
+  Movement (relative to camera facing):
+    W / S           — Walk forward / backward
     A / D           — Strafe left / right
-    Space / Z       — Move up / down
-    Shift + WASD    — Sprint (2× speed)
+    Q / E           — Fly up / down
+    F               — Toggle sprint (3× speed)
+    + / −           — Adjust base movement speed
 
-  Camera:
-    Left-click drag — Orbit / look around
-    Right-click drag— Pan
-    Scroll wheel    — Dolly zoom (move along view axis)
+  Look:
+    Arrow Keys      — Turn / tilt camera
+    Mouse Drag      — Orbit look (synced into FPS state)
 
-  View Modes:
-    1               — Original colors (RGB from reconstruction)
-    2               — Semantic colors (label-based hue mapping)
-    3               — Height heatmap (turbo colormap on Y-axis)
+  Interaction:
+    X               — Raycast from camera center (identify + highlight)
+    C               — Clear current highlight
 
   Display:
-    + / -           — Increase / decrease point size
-    B               — Toggle background (black ↔ white)
-    L               — Toggle lighting
-    G               — Toggle coordinate axes grid
-    R               — Reset camera to initial view
-
-  Utility:
-    P               — Print current camera parameters
-    H               — Print help / controls
-    Q / Esc         — Quit
+    1               — Original RGB colors
+    2               — Semantic overlay colors
+    [ / ]           — Point size down / up
+    B               — Toggle background (dark ↔ light)
+    R               — Reset camera to start
+    P               — Print camera info
+    H               — Show controls
+    Esc             — Quit
 
 ══════════════════════════════════════════════════════════════════════
 
 Usage:
     uv run python tools/interactive_viewer.py [path/to/file.ply]
-
-    If no path is given, auto-detects in this order:
-      1. outputs/final/semantic_world_clean.ply
-      2. outputs/final/semantic_world.ply
-      3. outputs/geometry/reconstruction.ply
 """
 
 import os
 import sys
+import json
+import math
 import argparse
+import struct
 import numpy as np
 import open3d as o3d
 
-try:
-    import matplotlib.cm as cm
 
-    HAS_MATPLOTLIB = True
-except ImportError:
-    HAS_MATPLOTLIB = False
+# ═══════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
 
+WINDOW_W, WINDOW_H = 1600, 900
 
-# ─── Configuration ──────────────────────────────────────────────────────
-DEFAULT_POINT_SIZE = 2.0
-MIN_POINT_SIZE = 0.5
-MAX_POINT_SIZE = 10.0
-POINT_SIZE_STEP = 0.5
+MOVE_SPEED_FRACTION = 0.02  # fraction of scene diagonal per keypress
+SPRINT_MULTIPLIER = 3.0
+YAW_SENSITIVITY = 0.03  # radians per arrow key press
+PITCH_SENSITIVITY = 0.02
+MAX_PITCH = math.radians(85)
 
-MOVE_SPEED = 0.05  # Units per keypress
-SPRINT_MULTIPLIER = 2.5
+POINT_SIZE = 2.0
+BG_DARK = [0.03, 0.03, 0.05]
+BG_LIGHT = [1.0, 1.0, 1.0]
 
-BG_BLACK = [0.05, 0.05, 0.08]
-BG_WHITE = [1.0, 1.0, 1.0]
+HIGHLIGHT_BLEND = 0.35
+HIGHLIGHT_COLOR = np.array([1.0, 0.95, 0.4])
 
-# Key codes (Open3D uses GLFW key codes)
-# Letters are uppercase ASCII values
-KEY_W = ord("W")
-KEY_A = ord("A")
-KEY_S = ord("S")
-KEY_D = ord("D")
-KEY_Q = ord("Q")
-KEY_R = ord("R")
-KEY_B = ord("B")
-KEY_L = ord("L")
-KEY_G = ord("G")
-KEY_H = ord("H")
-KEY_P = ord("P")
-KEY_Z = ord("Z")
-KEY_1 = ord("1")
-KEY_2 = ord("2")
-KEY_3 = ord("3")
-KEY_SPACE = 32
-KEY_PLUS = 61   # '=' key (unshifted '+')
-KEY_MINUS = 45  # '-' key
+RAYCAST_MAX_DIST_FRAC = 0.8  # max raycast distance as fraction of diagonal
+RAYCAST_SAMPLES = 120  # samples along ray
+RAYCAST_RADIUS_FRAC = 0.015  # KDTree search radius as fraction of diagonal
+
+# GLFW key codes used by Open3D
+KEY_LEFT = 263
+KEY_RIGHT = 262
+KEY_UP = 265
+KEY_DOWN = 264
+KEY_LSHIFT = 340
 KEY_ESC = 256
 
 
-# ─── Viewer State ───────────────────────────────────────────────────────
-
-class ViewerState:
-    """Mutable state container for the interactive viewer."""
-
-    def __init__(self):
-        self.point_size = DEFAULT_POINT_SIZE
-        self.bg_is_dark = True
-        self.lighting_on = False
-        self.grid_visible = False
-        self.color_mode = "original"  # "original", "semantic", "heatmap"
-
-        # Store color arrays for mode switching
-        self.original_colors = None
-        self.semantic_colors = None
-        self.heatmap_colors = None
+# ═══════════════════════════════════════════════════════════════════
+#  PLY LOADER (custom binary reader for label_id field)
+# ═══════════════════════════════════════════════════════════════════
 
 
-# ─── Helpers ────────────────────────────────────────────────────────────
+def load_semantic_ply(ply_path):
+    """Load a PLY with the custom label_id field from FusionEngine
 
-def find_default_ply(project_root: str) -> str:
-    """Auto-detect the best available PLY file."""
-    candidates = [
-        os.path.join(project_root, "outputs", "final", "semantic_world_clean.ply"),
-        os.path.join(project_root, "outputs", "final", "semantic_world.ply"),
-        os.path.join(project_root, "outputs", "geometry", "reconstruction.ply"),
-    ]
+    Returns:
+        pcd: o3d.geometry.PointCloud
+        labels: (N,) int32 array of per-vertex label IDs
+    """
+    with open(ply_path, "rb") as f:
+        header_lines = []
+        while True:
+            line = f.readline().decode("ascii").strip()
+            header_lines.append(line)
+            if line == "end_header":
+                break
 
-    for path in candidates:
-        if os.path.exists(path):
-            return path
+        # Parse header
+        n_vertices = 0
+        properties = []
+        for line in header_lines:
+            if line.startswith("element vertex"):
+                n_vertices = int(line.split()[-1])
+            elif line.startswith("property"):
+                parts = line.split()
+                properties.append((parts[1], parts[2]))
 
-    raise FileNotFoundError(
-        "No PLY file found. Expected one of:\n"
-        + "\n".join(f"  • {c}" for c in candidates)
-        + "\n\nRun the pipeline first, or pass a PLY path as argument."
+        has_label = any(name == "label_id" for _, name in properties)
+
+        if not has_label:
+            # Fall back to standard Open3D loader
+            print("  No label_id field — falling back to Open3D loader")
+            pcd = o3d.io.read_point_cloud(ply_path)
+            return pcd, np.zeros(len(pcd.points), dtype=np.int32)
+
+        # Build numpy structured dtype
+        type_map = {
+            "float": "<f4",
+            "double": "<f8",
+            "uchar": "u1",
+            "uint8": "u1",
+            "int": "<i4",
+            "int32": "<i4",
+        }
+
+        dt_fields = []
+        for ptype, pname in properties:
+            np_type = type_map.get(ptype)
+            if np_type is None:
+                raise ValueError(f"Unknown PLY type: {ptype}")
+            dt_fields.append((pname, np_type))
+
+        vertex_dtype = np.dtype(dt_fields)
+        raw = np.frombuffer(
+            f.read(n_vertices * vertex_dtype.itemsize), dtype=vertex_dtype
+        )
+
+    points = np.column_stack(
+        [
+            raw["x"].astype(np.float64),
+            raw["y"].astype(np.float64),
+            raw["z"].astype(np.float64),
+        ]
+    )
+    colors = np.column_stack(
+        [
+            raw["red"].astype(np.float64) / 255.0,
+            raw["green"].astype(np.float64) / 255.0,
+            raw["blue"].astype(np.float64) / 255.0,
+        ]
+    )
+    labels = raw["label_id"].astype(np.int32)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    n_labeled = int((labels > 0).sum())
+    print(
+        f"  Loaded {n_vertices:,} vertices with label_id "
+        f"({n_labeled:,} labeled, {len(np.unique(labels[labels > 0]))} classes)"
+    )
+    return pcd, labels
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  FPS CAMERA CONTROLLER
+# ═══════════════════════════════════════════════════════════════════
+
+
+class FPSController:
+    """First-person camera controller using yaw/pitch state.
+
+    OpenCV camera convention (matching DUSt3R/Open3D):
+      X = right, Y = down, Z = forward
+      R = R_pitch(φ) @ R_yaw(θ)
+
+    Maintains its own state and syncs bidirectionally with Open3D's
+    ViewControl extrinsic matrix.
+    """
+
+    def __init__(self, scene_diagonal):
+        self.cam_pos = np.zeros(3, dtype=np.float64)
+        self.yaw = 0.0
+        self.pitch = 0.0
+        self.move_speed = scene_diagonal * MOVE_SPEED_FRACTION
+        self.sprint_on = False
+
+    @property
+    def speed(self):
+        return self.move_speed * (SPRINT_MULTIPLIER if self.sprint_on else 1.0)
+
+    @staticmethod
+    def _Ry(theta):
+        c, s = math.cos(theta), math.sin(theta)
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+
+    @staticmethod
+    def _Rx(phi):
+        c, s = math.cos(phi), math.sin(phi)
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+    def _build_R(self):
+        return self._Rx(self.pitch) @ self._Ry(self.yaw)
+
+    def _extract_yaw_pitch(self, R):
+        self.yaw = math.atan2(R[0, 2], R[0, 0])
+        self.pitch = math.asin(float(np.clip(R[2, 1], -1.0, 1.0)))
+
+    def build_extrinsic(self):
+        R = self._build_R()
+        ext = np.eye(4, dtype=np.float64)
+        ext[:3, :3] = R
+        ext[:3, 3] = -R @ self.cam_pos
+        return ext
+
+    def sync_from_extrinsic(self, ext):
+        R = ext[:3, :3].copy()
+        t = ext[:3, 3].copy()
+        self.cam_pos = -(R.T @ t)
+        self._extract_yaw_pitch(R)
+
+    def forward_vec(self):
+        """Forward direction on horizontal XZ plane."""
+        return np.array([math.sin(self.yaw), 0.0, math.cos(self.yaw)])
+
+    def right_vec(self):
+        return np.array([math.cos(self.yaw), 0.0, -math.sin(self.yaw)])
+
+    @staticmethod
+    def up_vec():
+        """World up = -Y in OpenCV."""
+        return np.array([0.0, -1.0, 0.0])
+
+    def look_dir_3d(self):
+        """Full 3D forward direction (includes pitch), in OpenCV convention.
+
+        In OpenCV: Z=forward, Y=down
+        R = Rx(pitch) @ Ry(yaw), forward = R^T @ [0,0,1]
+        """
+        R = self._build_R()
+        return R.T @ np.array([0.0, 0.0, 1.0])
+
+    def move(self, forward=0.0, right=0.0, up=0.0):
+        s = self.speed
+        self.cam_pos += (
+            forward * s * self.forward_vec()
+            + right * s * self.right_vec()
+            + up * s * self.up_vec()
+        )
+
+    def look(self, dyaw=0.0, dpitch=0.0):
+        self.yaw += dyaw * YAW_SENSITIVITY
+        self.pitch = float(
+            np.clip(self.pitch + dpitch * PITCH_SENSITIVITY, -MAX_PITCH, MAX_PITCH)
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  SEMANTIC HIGHLIGHT ENGINE
+# ═══════════════════════════════════════════════════════════════════
+
+
+class SemanticHighlighter:
+    """Manages highlight state for semantic raycasting.
+
+    Pre-indexes all label regions at startup. Uses vectorized numpy
+    ops for fast highlight/unhighlight.
+    """
+
+    def __init__(self, original_colors, labels, label_map):
+        self.original_colors = original_colors.copy()
+        self.labels = labels
+        self.label_map = label_map
+        self.current_label = -1
+        self.n = len(labels)
+
+        # Pre-compute label masks
+        unique_labels = np.unique(labels[labels > 0])
+        self.label_masks = {}
+        for lbl in unique_labels:
+            self.label_masks[int(lbl)] = np.where(labels == lbl)[0]
+
+        print(f"  Highlighter: {len(self.label_masks)} semantic regions indexed")
+
+    def get_label_name(self, label_id):
+        if label_id <= 0:
+            return ""
+        return self.label_map.get(
+            str(label_id), self.label_map.get(label_id, f"object_{label_id}")
+        )
+
+    def highlight(self, label_id, colors_array):
+        """Highlight a semantic region. Returns True if colors changed."""
+        if label_id == self.current_label:
+            return False
+
+        # Revert previous highlight
+        if self.current_label > 0 and self.current_label in self.label_masks:
+            idx = self.label_masks[self.current_label]
+            colors_array[idx] = self.original_colors[idx]
+
+        # Apply new highlight
+        if label_id > 0 and label_id in self.label_masks:
+            idx = self.label_masks[label_id]
+            blended = (1.0 - HIGHLIGHT_BLEND) * self.original_colors[
+                idx
+            ] + HIGHLIGHT_BLEND * HIGHLIGHT_COLOR[np.newaxis, :]
+            colors_array[idx] = np.clip(blended, 0.0, 1.0)
+
+        self.current_label = label_id
+        return True
+
+    def clear(self, colors_array):
+        return self.highlight(-1, colors_array)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  RAYCASTER
+# ═══════════════════════════════════════════════════════════════════
+
+
+class PointCloudRaycaster:
+    """KDTree-based raycaster for semantic point clouds.
+
+    Casts a ray from camera origin along the view direction, sampling
+    points along the ray and querying the KDTree at each sample for
+    the nearest labeled point.
+    """
+
+    def __init__(self, points, labels, search_radius, max_dist, n_samples):
+        self.points = points
+        self.labels = labels
+        self.search_radius = search_radius
+        self.max_dist = max_dist
+        self.n_samples = n_samples
+
+        pcd_for_tree = o3d.geometry.PointCloud()
+        pcd_for_tree.points = o3d.utility.Vector3dVector(points)
+        self.kdtree = o3d.geometry.KDTreeFlann(pcd_for_tree)
+
+        print(
+            f"  Raycaster: KDTree built, radius={search_radius:.4f}, "
+            f"max_dist={max_dist:.2f}, samples={n_samples}"
+        )
+
+    def cast(self, origin, direction):
+        """Cast a ray and return the label of the first hit (0 = miss)."""
+        direction = direction / (np.linalg.norm(direction) + 1e-12)
+
+        # Sample along the ray
+        t_values = np.linspace(0.02, self.max_dist, self.n_samples)
+
+        for t in t_values:
+            pt = origin + t * direction
+            [k, idx, dists] = self.kdtree.search_radius_vector_3d(
+                pt, self.search_radius
+            )
+
+            if k > 0:
+                idx_arr = np.array(idx[:k])
+                dist_arr = np.array(dists[:k])
+                order = np.argsort(dist_arr)
+
+                for j in order:
+                    lbl = int(self.labels[idx_arr[j]])
+                    if lbl > 0:
+                        return lbl
+
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  VIEWER
+# ═══════════════════════════════════════════════════════════════════
+
+
+def push_camera(vis, fps, intrinsic):
+    """Push FPS controller state to Open3D ViewControl."""
+    cam = o3d.camera.PinholeCameraParameters()
+    cam.intrinsic = intrinsic
+    cam.extrinsic = fps.build_extrinsic()
+    vis.get_view_control().convert_from_pinhole_camera_parameters(
+        cam, allow_arbitrary=True
     )
 
 
-def compute_semantic_colors(points: np.ndarray, pcd: o3d.geometry.PointCloud) -> np.ndarray:
-    """Generate semantic colors from vertex colors using golden-angle hue.
+def sync_camera(vis, fps):
+    """Sync Open3D ViewControl state back into FPS controller."""
+    cam = vis.get_view_control().convert_to_pinhole_camera_parameters()
+    fps.sync_from_extrinsic(np.array(cam.extrinsic))
 
-    If the PLY has label_id encoded in colors (from FusionEngine), this
-    attempts to recover distinct semantic colors. Otherwise, uses a simple
-    spatial hash for visual distinction.
-    """
-    n = len(points)
 
-    # Use a spatial hash to create visually distinct regions
-    # This works even without explicit label IDs
-    grid_size = 0.1
-    spatial_hash = (
-        (points[:, 0] / grid_size).astype(int) * 73856093
-        ^ (points[:, 1] / grid_size).astype(int) * 19349663
-        ^ (points[:, 2] / grid_size).astype(int) * 83492791
-    ) % 256
+def print_controls():
+    print("""
+╔═══════════════════════════════════════════════════════════════╗
+║           MIRRA INTERACTIVE SEMANTIC VIEWER                   ║
+╠═══════════════════════════════════════════════════════════════╣
+║                                                               ║
+║  Movement (relative to camera):                               ║
+║    W / S        — Walk forward / backward                     ║
+║    A / D        — Strafe left / right                         ║
+║    Q / E        — Fly up / down                               ║
+║    F            — Toggle sprint (3× speed)                    ║
+║    + / −        — Adjust movement speed                       ║
+║                                                               ║
+║  Look:                                                        ║
+║    Arrow Keys   — Turn / tilt camera                          ║
+║    Mouse Drag   — Orbit look (synced to FPS)                  ║
+║                                                               ║
+║  Interaction:                                                 ║
+║    X            — Raycast: identify & highlight object         ║
+║    C            — Clear highlight                             ║
+║                                                               ║
+║  Display:                                                     ║
+║    1            — Original RGB colors                         ║
+║    2            — Semantic overlay colors                     ║
+║    [ / ]        — Point size down / up                        ║
+║    B            — Toggle background                           ║
+║    R            — Reset camera                                ║
+║    P            — Print camera info                           ║
+║    H            — This help                                   ║
+║    Esc          — Quit                                        ║
+║                                                               ║
+║  ┌───────────────────────────────────────────────────────┐    ║
+║  │  Aim with arrow keys / mouse drag, then press X to   │    ║
+║  │  raycast from the camera center — the targeted       │    ║
+║  │  object will highlight and its name will appear.     │    ║
+║  └───────────────────────────────────────────────────────┘    ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+""")
 
-    # Use golden-angle hue mapping (matching FusionEngine convention)
-    hues = (spatial_hash.astype(np.float64) * 137.5) % 360.0
 
-    # HSV to RGB conversion (vectorized)
-    h60 = hues / 60.0
-    sectors = h60.astype(int) % 6
-    frac = 1.0 - np.abs(h60 % 2.0 - 1.0)
-    x_vals = frac
+def find_default_ply(project_root):
+    """Auto-detect best available PLY (prefer labeled version)."""
+    for sub in [
+        "outputs/final/semantic_world.ply",  # has label_id
+        "outputs/final/semantic_world_clean.ply",
+        "outputs/geometry/reconstruction.ply",
+    ]:
+        p = os.path.join(project_root, sub)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("No PLY found. Pass path as argument.")
 
-    semantic_rgb = np.zeros((n, 3), dtype=np.float64)
+
+def generate_semantic_colors(original_colors, labels):
+    """Generate distinct semantic colors for each label using golden-angle hue."""
+    n = len(labels)
+    result = original_colors.copy()
+
+    labeled_mask = labels > 0
+    if not np.any(labeled_mask):
+        return result
+
+    label_ids = labels[labeled_mask]
+    hues = (label_ids.astype(np.float64) * 137.5) % 360.0
+    sectors = (hues / 60.0).astype(int) % 6
+    frac = 1.0 - np.abs((hues / 60.0) % 2.0 - 1.0)
+
+    semantic_rgb = np.zeros((len(label_ids), 3), dtype=np.float64)
     for s in range(6):
         m = sectors == s
         if not np.any(m):
             continue
-        xv = x_vals[m]
+        xv = frac[m]
         if s == 0:
             semantic_rgb[m] = np.column_stack([np.ones_like(xv), xv, np.zeros_like(xv)])
         elif s == 1:
@@ -181,365 +488,347 @@ def compute_semantic_colors(points: np.ndarray, pcd: o3d.geometry.PointCloud) ->
         elif s == 5:
             semantic_rgb[m] = np.column_stack([np.ones_like(xv), np.zeros_like(xv), xv])
 
-    return semantic_rgb
+    result[labeled_mask] = semantic_rgb
+    return result
 
 
-def compute_heatmap_colors(points: np.ndarray) -> np.ndarray:
-    """Generate height-based heatmap colors using the turbo colormap."""
-    # Use Y-axis (vertical in OpenCV/DUSt3R convention)
-    heights = points[:, 1]
+def create_viewer(ply_path, label_map_path=None):
+    """Create and run the interactive semantic viewer."""
 
-    # Percentile clipping for robust normalization
-    v_lo = np.percentile(heights, 1)
-    v_hi = np.percentile(heights, 99)
-    normalized = np.clip((heights - v_lo) / (v_hi - v_lo + 1e-8), 0, 1)
-
-    if HAS_MATPLOTLIB:
-        rgba = cm.turbo(normalized)
-        return rgba[:, :3]
-    else:
-        # Fallback: simple blue-to-red gradient
-        colors = np.zeros((len(points), 3), dtype=np.float64)
-        colors[:, 0] = normalized        # Red channel
-        colors[:, 2] = 1.0 - normalized  # Blue channel
-        return colors
-
-
-def print_controls():
-    """Print the controls help message."""
-    print(
-        """
-╔══════════════════════════════════════════════════════╗
-║           INTERACTIVE 3D POINT CLOUD VIEWER          ║
-╠══════════════════════════════════════════════════════╣
-║                                                      ║
-║  Movement:                                           ║
-║    W/S        — Forward / Backward                   ║
-║    A/D        — Strafe Left / Right                  ║
-║    Space/Z    — Up / Down                            ║
-║                                                      ║
-║  Camera:                                             ║
-║    Left-drag  — Orbit / Look                         ║
-║    Right-drag — Pan                                  ║
-║    Scroll     — Dolly zoom                           ║
-║                                                      ║
-║  View Modes:                                         ║
-║    1          — Original RGB colors                  ║
-║    2          — Semantic region colors               ║
-║    3          — Height heatmap                       ║
-║                                                      ║
-║  Display:                                            ║
-║    +/−        — Point size                           ║
-║    B          — Toggle background                    ║
-║    L          — Toggle lighting                      ║
-║    R          — Reset camera                         ║
-║                                                      ║
-║  Utility:                                            ║
-║    P          — Print camera info                    ║
-║    H          — This help message                    ║
-║    Q / Esc    — Quit                                 ║
-║                                                      ║
-╚══════════════════════════════════════════════════════╝
-"""
-    )
-
-
-# ─── Main Viewer ────────────────────────────────────────────────────────
-
-def create_viewer(ply_path: str):
-    """Create and launch the interactive viewer.
-
-    Uses Open3D's VisualizerWithKeyCallback to register custom key
-    handlers for FPS-style navigation. The viewer supports three
-    color modes (original, semantic, heatmap) and provides full
-    camera control via keyboard and mouse.
-    """
-    # ── Load Point Cloud ─────────────────────────────────────────
+    # ── Load Geometry ────────────────────────────────────────────
     print(f"\n  Loading: {ply_path}")
-    pcd = o3d.io.read_point_cloud(ply_path)
-    n_points = len(pcd.points)
+    pcd, labels = load_semantic_ply(ply_path)
+    n = len(pcd.points)
 
-    if n_points == 0:
-        # Try as mesh
-        mesh = o3d.io.read_triangle_mesh(ply_path)
-        if len(mesh.vertices) > 0:
-            mesh.compute_vertex_normals()
-            pcd = mesh.sample_points_uniformly(number_of_points=500000)
-            n_points = len(pcd.points)
-            print(f"  Converted mesh → {n_points:,} sampled points")
-        else:
-            print("  ❌ File contains no geometry!")
-            return
+    if n == 0:
+        print("  ❌ No points!")
+        return
 
     points = np.asarray(pcd.points)
-    print(f"  Points: {n_points:,}")
+    bb_min, bb_max = points.min(0), points.max(0)
+    center = (bb_min + bb_max) / 2.0
+    diag = float(np.linalg.norm(bb_max - bb_min))
+    print(f"  Points: {n:,}  Diagonal: {diag:.3f}")
 
-    # Compute bounding box stats
-    bb_min = points.min(axis=0)
-    bb_max = points.max(axis=0)
-    extent = bb_max - bb_min
-    print(f"  Bounds: X=[{bb_min[0]:.2f}, {bb_max[0]:.2f}]  "
-          f"Y=[{bb_min[1]:.2f}, {bb_max[1]:.2f}]  "
-          f"Z=[{bb_min[2]:.2f}, {bb_max[2]:.2f}]")
-    print(f"  Extent: {extent[0]:.2f} × {extent[1]:.2f} × {extent[2]:.2f}")
-
-    # ── Pre-compute Color Modes ──────────────────────────────────
-    state = ViewerState()
-
-    # Store original colors
-    if pcd.has_colors():
-        state.original_colors = np.asarray(pcd.colors).copy()
+    # ── Load Label Map ───────────────────────────────────────────
+    label_map = {}
+    if label_map_path and os.path.exists(label_map_path):
+        with open(label_map_path) as f:
+            label_map = json.load(f)
     else:
-        state.original_colors = np.full((n_points, 3), 0.7)
-        pcd.colors = o3d.utility.Vector3dVector(state.original_colors)
+        auto_path = os.path.join(os.path.dirname(ply_path), "label_map.json")
+        if os.path.exists(auto_path):
+            with open(auto_path) as f:
+                label_map = json.load(f)
+            print(f"  Label map: {len(label_map)} entries (auto)")
 
-    # Pre-compute semantic and heatmap colors
-    print("  Pre-computing color modes...")
-    state.semantic_colors = compute_semantic_colors(points, pcd)
-    state.heatmap_colors = compute_heatmap_colors(points)
-    print("  ✓ Color modes ready (1=Original, 2=Semantic, 3=Heatmap)")
+    # ── Color Modes ──────────────────────────────────────────────
+    original_colors = np.asarray(pcd.colors).copy()
+    semantic_colors = generate_semantic_colors(original_colors, labels)
+    colors_array = original_colors.copy()
+    color_mode = {"current": "original"}
 
-    # ── Create Visualizer ────────────────────────────────────────
-    vis = o3d.visualization.VisualizerWithKeyCallback()
-    vis.create_window(
-        window_name=f"Mirra Viewer — {os.path.basename(ply_path)} ({n_points:,} pts)",
-        width=1440,
-        height=900,
+    # ── Subsystems ───────────────────────────────────────────────
+    highlighter = SemanticHighlighter(original_colors, labels, label_map)
+    raycaster = PointCloudRaycaster(
+        points,
+        labels,
+        search_radius=diag * RAYCAST_RADIUS_FRAC,
+        max_dist=diag * RAYCAST_MAX_DIST_FRAC,
+        n_samples=RAYCAST_SAMPLES,
     )
 
+    # ── FPS Controller ───────────────────────────────────────────
+    fps = FPSController(diag)
+    fps.cam_pos = center.copy()
+    fps.cam_pos[2] -= diag * 0.4
+    fps.yaw = 0.0
+    fps.pitch = 0.0
+
+    # ── Visualizer ───────────────────────────────────────────────
+    vis = o3d.visualization.VisualizerWithKeyCallback()
+    vis.create_window(
+        window_name=f"Mirra Viewer — {os.path.basename(ply_path)} ({n:,} pts)",
+        width=WINDOW_W,
+        height=WINDOW_H,
+    )
     vis.add_geometry(pcd)
 
-    # Configure initial render options
-    render_opt = vis.get_render_option()
-    render_opt.point_size = state.point_size
-    render_opt.background_color = np.array(BG_BLACK)
-    render_opt.light_on = state.lighting_on
+    opt = vis.get_render_option()
+    opt.point_size = POINT_SIZE
+    opt.background_color = np.array(BG_DARK)
+    opt.light_on = False
 
-    # Store initial camera for reset
-    view_ctl = vis.get_view_control()  # noqa: F841 — used implicitly by Open3D
+    focal = WINDOW_W * 0.8
+    intrinsic = o3d.camera.PinholeCameraIntrinsic(
+        WINDOW_W,
+        WINDOW_H,
+        focal,
+        focal,
+        WINDOW_W / 2.0,
+        WINDOW_H / 2.0,
+    )
+    push_camera(vis, fps, intrinsic)
+
+    # ── Mutable State ────────────────────────────────────────────
+    bg_state = {"dark": True}
+
+    def apply_colors():
+        """Push current colors_array into the point cloud."""
+        pcd.colors = o3d.utility.Vector3dVector(colors_array)
+        vis.update_geometry(pcd)
 
     # ── Key Callbacks ────────────────────────────────────────────
+    # Pattern: sync → modify → push → HUD
 
-    def move_camera(vis, direction):
-        """Move the camera in the specified direction."""
-        ctr = vis.get_view_control()
-        # Use Open3D's built-in camera movement
-        # We translate by manipulating the lookat/front/up vectors
-        cam = ctr.convert_to_pinhole_camera_parameters()
-        extrinsic = np.array(cam.extrinsic)
-
-        # Camera axes in world space (from extrinsic = w2c)
-        R = extrinsic[:3, :3]
-        right = R[0, :]     # Camera X axis
-        up = -R[1, :]       # Camera Y axis (negated for intuitive up)
-        forward = -R[2, :]  # Camera Z axis (negated: OpenGL convention)
-
-        speed = MOVE_SPEED * max(extent) * 0.1
-
-        if direction == "forward":
-            delta = forward * speed
-        elif direction == "backward":
-            delta = -forward * speed
-        elif direction == "left":
-            delta = -right * speed
-        elif direction == "right":
-            delta = right * speed
-        elif direction == "up":
-            delta = up * speed
-        elif direction == "down":
-            delta = -up * speed
-        else:
+    def _move(fwd=0.0, rt=0.0, up=0.0):
+        def cb(vis):
+            sync_camera(vis, fps)
+            fps.move(forward=fwd, right=rt, up=up)
+            push_camera(vis, fps, intrinsic)
+            _print_hud()
             return False
 
-        # Apply translation to extrinsic (move camera in world space)
-        # t_new = t_old - R @ delta (because extrinsic = [R | t] where t = -R @ cam_pos)
-        extrinsic[:3, 3] -= R @ delta
+        return cb
 
-        cam.extrinsic = extrinsic
-        ctr.convert_from_pinhole_camera_parameters(cam, allow_arbitrary=True)
+    def _look(dy=0.0, dp=0.0):
+        def cb(vis):
+            sync_camera(vis, fps)
+            fps.look(dyaw=dy, dpitch=dp)
+            push_camera(vis, fps, intrinsic)
+            _print_hud()
+            return False
+
+        return cb
+
+    def _print_hud():
+        p = fps.cam_pos
+        y = math.degrees(fps.yaw) % 360
+        pt = math.degrees(fps.pitch)
+        mode = "🏃SPRINT" if fps.sprint_on else "🚶 walk"
+        target = highlighter.get_label_name(highlighter.current_label)
+        target_str = f"  ▸ {target}" if target else ""
+        print(
+            f"  Pos:({p[0]:+7.3f},{p[1]:+7.3f},{p[2]:+7.3f}) "
+            f"Yaw:{y:5.0f}° Pitch:{pt:+5.0f}° "
+            f"{mode} spd:{fps.speed:.3f}"
+            f"{target_str}",
+            end="    \r",
+        )
+
+    # WASD movement
+    vis.register_key_callback(ord("W"), _move(fwd=+1))
+    vis.register_key_callback(ord("S"), _move(fwd=-1))
+    vis.register_key_callback(ord("A"), _move(rt=-1))
+    vis.register_key_callback(ord("D"), _move(rt=+1))
+    vis.register_key_callback(ord("Q"), _move(up=+1))
+    vis.register_key_callback(ord("E"), _move(up=-1))
+
+    # Arrow keys for look
+    vis.register_key_callback(KEY_LEFT, _look(dy=-1))
+    vis.register_key_callback(KEY_RIGHT, _look(dy=+1))
+    vis.register_key_callback(KEY_UP, _look(dp=-1))
+    vis.register_key_callback(KEY_DOWN, _look(dp=+1))
+
+    # Sprint toggle
+    def toggle_sprint(vis):
+        fps.sprint_on = not fps.sprint_on
+        m = "🏃 SPRINT ON" if fps.sprint_on else "🚶 Sprint off"
+        print(f"\n  ⚡ {m}  (speed: {fps.speed:.3f})")
         return False
 
-    def on_key_w(vis):
-        return move_camera(vis, "forward")
+    vis.register_key_callback(ord("F"), toggle_sprint)
+    vis.register_key_callback(KEY_LSHIFT, toggle_sprint)
 
-    def on_key_s(vis):
-        return move_camera(vis, "backward")
-
-    def on_key_a(vis):
-        return move_camera(vis, "left")
-
-    def on_key_d(vis):
-        return move_camera(vis, "right")
-
-    def on_key_space(vis):
-        return move_camera(vis, "up")
-
-    def on_key_z(vis):
-        return move_camera(vis, "down")
-
-    def on_key_plus(vis):
-        state.point_size = min(state.point_size + POINT_SIZE_STEP, MAX_POINT_SIZE)
-        render_opt.point_size = state.point_size
-        print(f"  Point size: {state.point_size:.1f}")
+    # Speed adjustment
+    def speed_up(vis):
+        fps.move_speed *= 1.5
+        print(f"\n  Speed: {fps.move_speed:.4f} (×1.5)")
         return False
 
-    def on_key_minus(vis):
-        state.point_size = max(state.point_size - POINT_SIZE_STEP, MIN_POINT_SIZE)
-        render_opt.point_size = state.point_size
-        print(f"  Point size: {state.point_size:.1f}")
+    def speed_down(vis):
+        fps.move_speed /= 1.5
+        print(f"\n  Speed: {fps.move_speed:.4f} (÷1.5)")
         return False
 
-    def on_key_b(vis):
-        state.bg_is_dark = not state.bg_is_dark
-        bg = BG_BLACK if state.bg_is_dark else BG_WHITE
-        render_opt.background_color = np.array(bg)
-        mode = "dark" if state.bg_is_dark else "light"
-        print(f"  Background: {mode}")
+    vis.register_key_callback(61, speed_up)
+    vis.register_key_callback(45, speed_down)
+
+    # Point size
+    def pt_up(vis):
+        opt.point_size = min(opt.point_size + 0.5, 15)
+        print(f"\n  Point size: {opt.point_size:.1f}")
         return False
 
-    def on_key_l(vis):
-        state.lighting_on = not state.lighting_on
-        render_opt.light_on = state.lighting_on
-        mode = "ON" if state.lighting_on else "OFF"
-        print(f"  Lighting: {mode}")
+    def pt_down(vis):
+        opt.point_size = max(opt.point_size - 0.5, 0.5)
+        print(f"\n  Point size: {opt.point_size:.1f}")
         return False
 
-    def on_key_r(vis):
-        vis.reset_view_point(True)
-        print("  Camera reset to initial view")
+    vis.register_key_callback(ord("]"), pt_up)
+    vis.register_key_callback(ord("["), pt_down)
+
+    # Background toggle
+    def toggle_bg(vis):
+        bg_state["dark"] = not bg_state["dark"]
+        opt.background_color = np.array(BG_DARK if bg_state["dark"] else BG_LIGHT)
+        mode = "dark" if bg_state["dark"] else "light"
+        print(f"\n  Background: {mode}")
         return False
 
-    def on_key_1(vis):
-        if state.color_mode != "original":
-            state.color_mode = "original"
-            pcd.colors = o3d.utility.Vector3dVector(state.original_colors)
-            vis.update_geometry(pcd)
-            print("  Color mode: Original RGB")
+    vis.register_key_callback(ord("B"), toggle_bg)
+
+    # Color modes
+    def set_original(vis):
+        if color_mode["current"] != "original":
+            color_mode["current"] = "original"
+            # Restore original and re-apply current highlight
+            colors_array[:] = original_colors
+            if highlighter.current_label > 0:
+                highlighter.current_label = -1  # force re-highlight
+            apply_colors()
+            print("\n  Color mode: Original RGB")
         return False
 
-    def on_key_2(vis):
-        if state.color_mode != "semantic":
-            state.color_mode = "semantic"
-            pcd.colors = o3d.utility.Vector3dVector(state.semantic_colors)
-            vis.update_geometry(pcd)
-            print("  Color mode: Semantic")
+    def set_semantic(vis):
+        if color_mode["current"] != "semantic":
+            color_mode["current"] = "semantic"
+            colors_array[:] = semantic_colors
+            highlighter.original_colors[:] = semantic_colors
+            if highlighter.current_label > 0:
+                old_label = highlighter.current_label
+                highlighter.current_label = -1
+                highlighter.highlight(old_label, colors_array)
+            apply_colors()
+            print("\n  Color mode: Semantic")
         return False
 
-    def on_key_3(vis):
-        if state.color_mode != "heatmap":
-            state.color_mode = "heatmap"
-            pcd.colors = o3d.utility.Vector3dVector(state.heatmap_colors)
-            vis.update_geometry(pcd)
-            print("  Color mode: Height Heatmap")
+    vis.register_key_callback(ord("1"), set_original)
+    vis.register_key_callback(ord("2"), set_semantic)
+
+    # Reset camera
+    def reset(vis):
+        fps.cam_pos = center.copy()
+        fps.cam_pos[2] -= diag * 0.4
+        fps.yaw, fps.pitch = 0.0, 0.0
+        push_camera(vis, fps, intrinsic)
+        print("\n  🔄 Camera reset")
         return False
 
-    def on_key_p(vis):
-        ctr = vis.get_view_control()
-        cam = ctr.convert_to_pinhole_camera_parameters()
-        ext = cam.extrinsic
-        intr = cam.intrinsic
-        print("\n  Camera Parameters:")
-        print(f"    Resolution: {intr.width}×{intr.height}")
-        print(f"    Focal: fx={intr.get_focal_length()[0]:.1f}, fy={intr.get_focal_length()[1]:.1f}")
-        print(f"    Principal: cx={intr.get_principal_point()[0]:.1f}, cy={intr.get_principal_point()[1]:.1f}")
-        print(f"    Position: [{ext[0,3]:.3f}, {ext[1,3]:.3f}, {ext[2,3]:.3f}]")
+    vis.register_key_callback(ord("R"), reset)
+
+    # Camera info
+    def info(vis):
+        sync_camera(vis, fps)
+        p = fps.cam_pos
+        print(f"\n  Position: [{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}]")
+        print(
+            f"  Yaw: {math.degrees(fps.yaw):.1f}°  Pitch: {math.degrees(fps.pitch):.1f}°"
+        )
+        print(f"  Speed: {fps.speed:.4f}  Sprint: {fps.sprint_on}")
+        print(f"  Look dir: {fps.look_dir_3d()}")
         return False
 
-    def on_key_h(vis):
-        print_controls()
+    vis.register_key_callback(ord("P"), info)
+
+    # ── RAYCASTING (X key) ─────────────────────────────────────
+    def do_raycast(vis):
+        sync_camera(vis, fps)
+        origin = fps.cam_pos.copy()
+        direction = fps.look_dir_3d()
+
+        label_id = raycaster.cast(origin, direction)
+
+        if label_id > 0:
+            name = highlighter.get_label_name(label_id)
+            count = int((labels == label_id).sum())
+            changed = highlighter.highlight(label_id, colors_array)
+            if changed:
+                apply_colors()
+
+            print(f"\n  ╔══════════════════════════════════════════╗")
+            print(f"  ║  🎯  TARGET: {name:<28s} ║")
+            print(f"  ║      Label ID: {label_id:<4d}  Points: {count:>8,}   ║")
+            print(f"  ╚══════════════════════════════════════════╝")
+        else:
+            print(f"\n  ╔══════════════════════════════════════════╗")
+            print(f"  ║  ❌  No object detected                  ║")
+            print(f"  ╚══════════════════════════════════════════╝")
+
         return False
 
-    def on_key_q(vis):
-        print("\n  Closing viewer...")
-        vis.close()
+    vis.register_key_callback(ord("X"), do_raycast)
+
+    # Clear highlight (C key)
+    def clear_highlight(vis):
+        changed = highlighter.clear(colors_array)
+        if changed:
+            apply_colors()
+            print("\n  Highlight cleared")
         return False
 
-    # ── Register Callbacks ───────────────────────────────────────
-    vis.register_key_callback(KEY_W, on_key_w)
-    vis.register_key_callback(KEY_S, on_key_s)
-    vis.register_key_callback(KEY_A, on_key_a)
-    vis.register_key_callback(KEY_D, on_key_d)
-    vis.register_key_callback(KEY_SPACE, on_key_space)
-    vis.register_key_callback(KEY_Z, on_key_z)
-    vis.register_key_callback(KEY_PLUS, on_key_plus)
-    vis.register_key_callback(KEY_MINUS, on_key_minus)
-    vis.register_key_callback(KEY_B, on_key_b)
-    vis.register_key_callback(KEY_L, on_key_l)
-    vis.register_key_callback(KEY_R, on_key_r)
-    vis.register_key_callback(KEY_1, on_key_1)
-    vis.register_key_callback(KEY_2, on_key_2)
-    vis.register_key_callback(KEY_3, on_key_3)
-    vis.register_key_callback(KEY_P, on_key_p)
-    vis.register_key_callback(KEY_H, on_key_h)
-    vis.register_key_callback(KEY_Q, on_key_q)
-    vis.register_key_callback(KEY_ESC, on_key_q)
+    vis.register_key_callback(ord("C"), clear_highlight)
+
+    # Help & Quit
+    vis.register_key_callback(ord("H"), lambda v: (print_controls(), False)[1])
+    vis.register_key_callback(KEY_ESC, lambda v: (v.close(), False)[1])
 
     # ── Launch ───────────────────────────────────────────────────
     print_controls()
-    print(f"  🚀 Viewer ready. Showing {n_points:,} points.\n")
+    print(f"  🚀 Ready. {n:,} points loaded.")
+    print(f"  ┌──────────────────────────────────────────────┐")
+    print(f"  │  Press X to raycast and identify objects      │")
+    print(f"  │  Press C to clear highlights                  │")
+    print(f"  └──────────────────────────────────────────────┘\n")
 
     vis.run()
     vis.destroy_window()
+    print("\n  Viewer closed.\n")
 
 
-# ─── CLI Entry Point ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Interactive 3D Point Cloud Viewer for Mirra",
+        description="Mirra Interactive Semantic Viewer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  uv run python tools/interactive_viewer.py
-  uv run python tools/interactive_viewer.py outputs/final/semantic_world.ply
-  uv run python tools/interactive_viewer.py outputs/geometry/reconstruction.ply
-        """,
+        epilog="Example:\n  uv run python tools/interactive_viewer.py",
     )
     parser.add_argument(
         "ply_path",
         nargs="?",
         default=None,
-        help="Path to PLY file. Auto-detects if omitted.",
+        help="Path to .ply file (auto-detects if omitted)",
     )
     parser.add_argument(
-        "--point-size",
-        type=float,
-        default=DEFAULT_POINT_SIZE,
-        help=f"Initial point size (default: {DEFAULT_POINT_SIZE})",
+        "--labels",
+        default=None,
+        help="Path to label_map.json (auto-detected if omitted)",
     )
-    parser.add_argument(
-        "--bg",
-        choices=["dark", "light"],
-        default="dark",
-        help="Initial background color (default: dark)",
-    )
-
     args = parser.parse_args()
 
-    # Determine project root
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
 
-    # Resolve PLY path
     if args.ply_path:
-        ply_path = args.ply_path
-        if not os.path.isabs(ply_path):
-            ply_path = os.path.join(project_root, ply_path)
+        ply = args.ply_path
+        if not os.path.isabs(ply):
+            ply = os.path.join(project_root, ply)
     else:
-        ply_path = find_default_ply(project_root)
+        ply = find_default_ply(project_root)
 
-    if not os.path.exists(ply_path):
-        print(f"❌ File not found: {ply_path}")
+    if not os.path.exists(ply):
+        print(f"❌ Not found: {ply}")
         sys.exit(1)
 
-    print("═" * 55)
-    print("  MIRRA INTERACTIVE 3D VIEWER")
-    print("═" * 55)
+    print("═" * 65)
+    print("  MIRRA INTERACTIVE SEMANTIC VIEWER")
+    print("═" * 65)
 
-    # Override defaults from CLI
-    create_viewer(ply_path)
-
-    print("\n  Viewer closed. Goodbye!\n")
+    create_viewer(ply, label_map_path=args.labels)
 
 
 if __name__ == "__main__":

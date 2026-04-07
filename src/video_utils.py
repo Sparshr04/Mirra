@@ -58,6 +58,33 @@ def get_device(cfg: DictConfig) -> str:
 _VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 
+def get_input_data(cfg: DictConfig, project_root: str) -> tuple[str, str]:
+    """Locate the input data: either a photo directory or a video file.
+
+    Priority:
+      1. If `data/raw/images/` exists and contains valid .jpg/.png images,
+         return ("photos", "data/raw/images").
+      2. If a specific ``video_filename`` is configured, try using it.
+      3. Otherwise, auto-detect the NEWEST video file in ``raw_video_dir``.
+
+    Raises:
+        FileNotFoundError: if no video or photos can be found.
+    """
+    raw_dir = Path(project_root) / cfg.dataset.raw_video_dir
+    images_dir = raw_dir / "images"
+
+    if images_dir.exists() and images_dir.is_dir():
+        image_files = []
+        for item in images_dir.iterdir():
+            if item.is_file() and item.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                image_files.append(item)
+        if image_files:
+            print("Photo directory detected. Skipping video extraction.")
+            return "photos", str(images_dir)
+            
+    # Fallback to video discovery
+    return "video", find_video(cfg, project_root)
+
 def find_video(cfg: DictConfig, project_root: str) -> str:
     """Locate the input video using the unified dataset config.
 
@@ -291,4 +318,62 @@ def extract_frames(
 
     # Write metadata for future cache validation
     _save_frame_metadata(frames_dir, video_path, len(frames), cfg)
+    return frames, frames_dir
+
+def ingest_photos(
+    images_dir: str,
+    cfg: DictConfig,
+    project_root: str,
+) -> tuple[list[np.ndarray], str]:
+    """Ingest photos from a directory, resize them, and populate the cache.
+
+    Returns:
+        frames: list of RGB numpy arrays (H, W, 3) uint8
+        frames_dir: absolute path to the directory of saved JPEG frames
+    """
+    frames_dir = os.path.join(project_root, cfg.dataset.processed_frames_dir)
+    os.makedirs(frames_dir, exist_ok=True)
+    
+    resolution = cfg.resolution
+
+    # Sort images and read
+    image_paths = sorted([
+        os.path.join(images_dir, f) for f in os.listdir(images_dir)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ])
+    
+    if not image_paths:
+        raise FileNotFoundError(f"No images found in {images_dir}")
+
+    # Check stale data
+    existing = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+    if existing and _validate_frame_cache(frames_dir, images_dir, cfg):
+        print(f"Found {len(existing)} cached photo frames. Reusing them.")
+        frames = []
+        for fname in existing:
+            img = cv2.imread(os.path.join(frames_dir, fname))
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            frames.append(rgb)
+        return frames, frames_dir
+
+    if existing:
+        _clear_frame_cache(frames_dir)
+
+    print(f"Ingesting {len(image_paths)} photos from {images_dir}...")
+    frames = []
+    
+    for i, img_path in enumerate(image_paths):
+        img = cv2.imread(img_path)
+        if img is None:
+            continue
+            
+        resized_frame = cv2.resize(img, (resolution, resolution))
+        rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+        frames.append(rgb_frame)
+        
+        save_path = os.path.join(frames_dir, f"{i:05d}.jpg")
+        cv2.imwrite(save_path, resized_frame)
+
+    print(f"Ingested {len(frames)} photos (saved to {frames_dir}).")
+    _save_frame_metadata(frames_dir, images_dir, len(frames), cfg)
     return frames, frames_dir

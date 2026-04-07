@@ -238,11 +238,11 @@ class SemanticEngine:
         _flush_mps_memory()
         print("  🧹 Image model + mask generator freed (no longer needed)")
 
-    def process_video(self, video_path: str):
-        """Process video with multi-keyframe auto-masking.
+    def process_input(self, mode: str, data_path: str):
+        """Process input (video or photos) with multi-keyframe auto-masking.
 
         Strategy:
-          1. Extract frames to disk (required by SAM 2 video predictor)
+          1. Extract frames or ingest photos to disk (required by SAM 2 video predictor)
           2. Initialize video tracking state
           3. For each keyframe:
              a. Run automatic mask generation
@@ -260,8 +260,12 @@ class SemanticEngine:
             output_masks: dict of {frame_idx: {obj_id: (H, W) bool mask}}
             frames_dir: path to the extracted frames directory
         """
+        from src.video_utils import extract_frames, ingest_photos
         # 1. Prepare Frames
-        frames, frames_dir = extract_frames(video_path, self.cfg, self.project_root)
+        if mode == "photos":
+            frames, frames_dir = ingest_photos(data_path, self.cfg, self.project_root)
+        else:
+            frames, frames_dir = extract_frames(data_path, self.cfg, self.project_root)
 
         # Automatically match the device type for Mixed Precision
         if "cuda" in str(self.device):
@@ -492,9 +496,10 @@ def main(cfg: DictConfig):
     engine = SemanticEngine(cfg)
 
     video_path = find_video(cfg, engine.project_root)
-    print(f"Processing video: {video_path}")
+    print(f"Processing input: {video_path}")
 
-    output_masks, frames_dir = engine.process_video(video_path)
+    # Fallback for standalone script
+    output_masks, frames_dir = engine.process_input("video", video_path)
     engine.save_outputs(output_masks, frames_dir)
     engine.unload_all_models()
 

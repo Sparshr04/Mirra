@@ -49,7 +49,7 @@ from omegaconf import DictConfig, OmegaConf
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-from src.video_utils import find_video, extract_frames
+from src.video_utils import get_input_data, extract_frames, ingest_photos
 from src.config_presets import apply_preset
 
 
@@ -73,12 +73,13 @@ def _flush_mps_memory():
 # ─── Stage Workers (run in separate processes) ──────────────────────
 
 
-def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
+def _run_geometry(cfg_dict: dict, mode: str, data_path: str, project_root: str) -> str:
     """Run the VGGT geometry stage in a subprocess.
 
     Args:
         cfg_dict: Serialized OmegaConf config (plain dict for pickling)
-        video_path: Path to the video file
+        mode: "video" or "photos"
+        data_path: Path to the input video or photo directory
         project_root: Project root directory
 
     Returns:
@@ -88,7 +89,7 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
     import torch
     from omegaconf import OmegaConf
     from src.geometry_engine_v2 import GeometryEngineV2
-    from src.video_utils import extract_frames, get_device
+    from src.video_utils import extract_frames, ingest_photos, get_device
 
     cfg = OmegaConf.create(cfg_dict)
 
@@ -127,9 +128,13 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
     os.makedirs(engine.depth_dir, exist_ok=True)
 
     # Run inference
-    frames, frames_dir = extract_frames(video_path, cfg, project_root)
+    if mode == "photos":
+        frames, frames_dir = ingest_photos(data_path, cfg, project_root)
+    else:
+        frames, frames_dir = extract_frames(data_path, cfg, project_root)
+        
     if not frames:
-        return "FAILED: No frames extracted"
+        return "FAILED: No frames extracted/ingested"
 
     result = engine.run_inference(frames)
     engine.save_outputs(result, frames)
@@ -144,12 +149,13 @@ def _run_geometry(cfg_dict: dict, video_path: str, project_root: str) -> str:
     return "SUCCESS"
 
 
-def _run_semantics(cfg_dict: dict, video_path: str, project_root: str) -> str:
+def _run_semantics(cfg_dict: dict, mode: str, data_path: str, project_root: str) -> str:
     """Run the SAM 2 semantics stage in a subprocess.
 
     Args:
         cfg_dict: Serialized OmegaConf config (plain dict for pickling)
-        video_path: Path to the video file
+        mode: "video" or "photos"
+        data_path: Path to the video or photo directory
         project_root: Project root directory
 
     Returns:
@@ -166,7 +172,7 @@ def _run_semantics(cfg_dict: dict, video_path: str, project_root: str) -> str:
     # Override project root for subprocess context
     engine.project_root = project_root
 
-    output_masks, frames_dir = engine.process_video(video_path)
+    output_masks, frames_dir = engine.process_input(mode, data_path)
     engine.save_outputs(output_masks, frames_dir)
 
     # ─── MEMORY CLEANUP ─────────────────────────────────────────
@@ -206,16 +212,21 @@ def main(cfg: DictConfig):
 
     pipeline_start = time.time()
 
-    # ─── STAGE 0: SHARED FRAME EXTRACTION ────────────────────────────
-    print("\n[0/3] Extracting frames (shared by both engines)...")
+    # ─── STAGE 0: SHARED FRAME EXTRACTION/INGESTION ──────────────────
+    print("\n[0/3] Preparing frames (shared by both engines)...")
     try:
-        video_path = find_video(cfg, project_root)
-        print(f"Processing video: {video_path}")
-        frames, frames_dir = extract_frames(video_path, cfg, project_root)
+        mode, data_path = get_input_data(cfg, project_root)
+        if mode == "photos":
+            print(f"Processing photo directory: {data_path}")
+            frames, frames_dir = ingest_photos(data_path, cfg, project_root)
+        else:
+            print(f"Processing video: {data_path}")
+            frames, frames_dir = extract_frames(data_path, cfg, project_root)
+            
         if not frames:
-            print("❌ No frames extracted. Aborting.")
+            print("❌ No frames prepared. Aborting.")
             sys.exit(1)
-        print(f"✅ Extracted {len(frames)} frames to {frames_dir}")
+        print(f"✅ Prepared {len(frames)} frames in {frames_dir}")
     except Exception as e:
         print(f"❌ Frame extraction failed: {e}")
         sys.exit(1)
@@ -236,10 +247,10 @@ def main(cfg: DictConfig):
         # Use ProcessPoolExecutor for true parallelism (GIL bypass)
         with ProcessPoolExecutor(max_workers=2) as executor:
             future_geo = executor.submit(
-                _run_geometry, cfg_dict, video_path, project_root
+                _run_geometry, cfg_dict, mode, data_path, project_root
             )
             future_sem = executor.submit(
-                _run_semantics, cfg_dict, video_path, project_root
+                _run_semantics, cfg_dict, mode, data_path, project_root
             )
 
             for future in as_completed([future_geo, future_sem]):
@@ -290,7 +301,7 @@ def main(cfg: DictConfig):
             from src.semantic_engine import SemanticEngine
 
             sem_engine = SemanticEngine(cfg)
-            output_masks, frames_dir = sem_engine.process_video(video_path)
+            output_masks, frames_dir = sem_engine.process_input(mode, data_path)
             sem_engine.save_outputs(output_masks, frames_dir)
 
             # ─── FREE SAM 2 MODELS BEFORE FUSION ────────────────

@@ -78,11 +78,10 @@ class FusionEngine:
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
 
-        self.project_root = (
-            hydra.utils.get_original_cwd()
-            if hasattr(hydra.utils, "get_original_cwd")
-            else os.getcwd()
-        )
+        try:
+            self.project_root = hydra.utils.get_original_cwd()
+        except ValueError:
+            self.project_root = os.getcwd()
 
         # ─── Config-driven TSDF parameters ───────────────────────────
         tsdf_cfg = cfg.get("tsdf", {})

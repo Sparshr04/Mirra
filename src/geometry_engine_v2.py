@@ -112,11 +112,10 @@ class GeometryEngineV2:
         self.device = get_device(cfg)
         print(f"GeometryEngineV2 (DUSt3R) initialized on device: {self.device}")
 
-        self.project_root = (
-            hydra.utils.get_original_cwd()
-            if hasattr(hydra.utils, "get_original_cwd")
-            else os.getcwd()
-        )
+        try:
+            self.project_root = hydra.utils.get_original_cwd()
+        except ValueError:
+            self.project_root = os.getcwd()
 
         self.checkpoints_dir = os.path.join(self.project_root, "checkpoints")
         os.makedirs(self.checkpoints_dir, exist_ok=True)

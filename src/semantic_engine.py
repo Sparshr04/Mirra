@@ -36,8 +36,7 @@ from omegaconf import DictConfig
 from tqdm import tqdm
 import pathlib
 from hydra.core.global_hydra import GlobalHydra
-from src.video_utils import get_device, find_video, extract_frames
-
+from src.video_utils import get_device
 
 # ─── MPS Memory Management ──────────────────────────────────────────
 
@@ -77,9 +76,10 @@ def setup_sam2():
             print(f"Error cloning SAM 2: {e}")
             sys.exit(1)
 
-    # Ensure it is installed
     try:
-        import sam2
+        import importlib.util
+        if importlib.util.find_spec("sam2") is None:
+            raise ImportError("SAM 2 not found")
     except ImportError:
         print("SAM 2 not found in environment. Installing...")
         try:
@@ -133,11 +133,10 @@ class SemanticEngine:
         self.device = get_device(cfg)
         print(f"SemanticEngine initialized on device: {self.device}")
 
-        self.project_root = (
-            str(pathlib.Path(__file__).resolve().parents[1])
-            if hasattr(hydra.utils, "get_original_cwd")
-            else os.getcwd()
-        )
+        try:
+            self.project_root = hydra.utils.get_original_cwd()
+        except ValueError:
+            self.project_root = str(pathlib.Path(__file__).resolve().parents[1])
         self.checkpoints_dir = os.path.join(self.project_root, "checkpoints")
         os.makedirs(self.checkpoints_dir, exist_ok=True)
 
@@ -205,74 +204,7 @@ class SemanticEngine:
                 print(f"Failed to download checkpoint: {e}")
                 sys.exit(1)
 
-    def has_photo_dir(self):
-        """Check if a photo directory is configured and exists."""
-        photo_dir = self.cfg.dataset.get("photo_dir", "")
-        if not photo_dir:
-            return False
-        abs_photo_dir = os.path.join(self.project_root, photo_dir)
-        return os.path.isdir(abs_photo_dir)
 
-    def get_photo_frames_dir(self):
-        """Return the processed frames directory (already populated by GeometryEngine).
-
-        When using photo-dir input, GeometryEngine has already copied and
-        resized the photos into processed_frames_dir. We just return that
-        path for SAM 2 to consume.
-        """
-        frames_dir = os.path.join(
-            self.project_root, self.cfg.dataset.processed_frames_dir
-        )
-        if not os.path.exists(frames_dir):
-            raise FileNotFoundError(
-                f"Processed frames not found at {frames_dir}. "
-                f"Run GeometryEngine first to populate frames from photo_dir."
-            )
-
-        existing = sorted(f for f in os.listdir(frames_dir) if f.endswith(".jpg"))
-        if not existing:
-            raise FileNotFoundError(
-                f"No .jpg frames found in {frames_dir}. "
-                f"GeometryEngine should have placed them there."
-            )
-
-        print(f"Using {len(existing)} pre-loaded photo frames from {frames_dir}")
-        return frames_dir
-
-    def _find_video(self):
-        """
-        Locate the input video using the unified dataset config.
-        Uses glob to auto-detect the first video if no specific filename is set.
-        """
-        raw_dir = os.path.join(self.project_root, self.cfg.dataset.raw_video_dir)
-        if not os.path.exists(raw_dir):
-            raise FileNotFoundError(f"Raw video directory not found: {raw_dir}")
-
-        # Check for a specific filename first
-        video_filename = self.cfg.dataset.get("video_filename", "")
-        if video_filename:
-            video_path = os.path.join(raw_dir, video_filename)
-            if os.path.exists(video_path):
-                return video_path
-            print(
-                f"Warning: Specified video '{video_filename}' not found, auto-detecting..."
-            )
-
-        # Auto-detect first video file
-        patterns = ["*.mp4", "*.mov", "*.avi", "*.mkv"]
-        for pattern in patterns:
-            matches = sorted(glob.glob(os.path.join(raw_dir, pattern)))
-            if matches:
-                return matches[0]
-
-        Returns filtered masks sorted by area (largest first).
-        """
-        masks = self.mask_generator.generate(frame_rgb)
-        # Filter by minimum area
-        masks = [m for m in masks if m["area"] > min_area]
-        # Sort by area descending (largest objects first for ID stability)
-        masks.sort(key=lambda m: m["area"], reverse=True)
-        return masks
 
     def _compute_iou(self, mask_a: np.ndarray, mask_b: np.ndarray) -> float:
         """Compute Intersection-over-Union between two boolean masks."""
@@ -336,54 +268,11 @@ class SemanticEngine:
 
         # The Official PyTorch/Meta fix: Automatic Mixed Precision (AMP)
         with torch.autocast(device_type=autocast_device, dtype=torch.bfloat16):
-            # 2. Initialize Video State
-            inference_state = self.video_predictor.init_state(video_path=frames_dir)
+            output_masks, res_frames_dir = self._run_segmentation(frames_dir)
 
-            frame_names = sorted(
-                [p for p in os.listdir(frames_dir) if p.endswith((".jpg", ".jpeg"))]
-            )
-            total_frames = len(frame_names)
-            min_area = self.cfg.semantics.min_mask_region_area
-
-            next_obj_id = 1
-            active_obj_ids = set()
-            IOU_MATCH_THRESHOLD = 0.3
-
-            keyframe_indices = list(range(0, total_frames, self.keyframe_interval))
-            if 0 not in keyframe_indices:
-                keyframe_indices.insert(0, 0)
-
-            print(
-                f"\nMulti-keyframe auto-masking: {len(keyframe_indices)} keyframes "
-                f"across {total_frames} frames"
-            )
-            print(f"  Keyframe indices: {keyframe_indices}")
-
-            output_masks = {}
-
-            frame_idx += 1
-
-        cap.release()
-        extracted = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
-        print(f"Frame extraction complete. {extracted} frames saved to {frames_dir}.")
-
-        # Write metadata for future cache validation
-        self._save_frame_metadata(frames_dir, video_path, extracted)
-        return frames_dir
-
-    def process_video_from_frames(self, frames_dir):
-        """Process pre-existing frames directory (for photo-dir mode).
-
-        Identical to process_video() but skips frame extraction since
-        the frames are already in frames_dir (placed by GeometryEngine).
-        """
-        return self._run_segmentation(frames_dir)
-
-    def process_video(self, video_path):
-        # 1. Prepare Frames
-        frames_dir = self.extract_frames(video_path)
-        # 2. Run segmentation on extracted frames
-        return self._run_segmentation(frames_dir)
+        # 3. Clean up image models since we're done with auto-masking phase
+        self._free_image_model()
+        return output_masks, res_frames_dir
 
     def _run_segmentation(self, frames_dir):
         """Core segmentation logic: auto-prompt Frame 0, propagate through all frames.
@@ -432,6 +321,7 @@ class SemanticEngine:
                     obj_id=obj_id,
                     mask=mask,
                 )
+            )
 
         # Save Frame 0 results
         if len(masks0) > 0:
@@ -545,11 +435,13 @@ def main(cfg: DictConfig):
 
     engine = SemanticEngine(cfg)
 
-    video_path = find_video(cfg, engine.project_root)
-    print(f"Processing input: {video_path}")
+    from src.video_utils import get_input_data
+    
+    mode, data_path = get_input_data(cfg, engine.project_root)
+    print(f"Processing input ({mode}): {data_path}")
 
     # Fallback for standalone script
-    output_masks, frames_dir = engine.process_input("video", video_path)
+    output_masks, frames_dir = engine.process_input(mode, data_path)
     engine.save_outputs(output_masks, frames_dir)
     engine.unload_all_models()
 

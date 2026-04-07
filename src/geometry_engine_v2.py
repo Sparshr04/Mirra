@@ -1,38 +1,30 @@
 """
 src/geometry_engine_v2.py
 ─────────────────────────
-VGGT-based Geometry Engine — with MPS Memory Optimization.
+DUSt3R-based Geometry Engine V2 — with MPS Memory Optimization.
 
-Replaces the DUSt3R-based GeometryEngine with Facebook's Visual Geometry
-Grounded Transformer (VGGT-1B). A single forward pass produces:
-  • Camera extrinsics (c2w) and intrinsics
-  • Metric depth maps
-  • Dense 3D pointmaps in world coordinates
+Replaces the VGGT model with Facebook's DUSt3R (ViT-Large).
+Matches all pairs ("complete" scene graph) for maximum accuracy.
 
 Memory Optimizations (M2 MPS):
-  • Aggressive tensor cleanup after inference (gc + mps.empty_cache)
-  • Immediate .cpu() conversion of prediction tensors
-  • Model unloading after inference in subprocess workers
-  • Configurable precision (float32 / bfloat16) via config
-  • Configurable input resolution downscale via vggt_resolution
+  • Hard cap of 15 images managed by frontend & API.
+  • Aggressive tensor cleanup after inference (gc + mps.empty_cache).
+  • Immediate .cpu() fallback for global alignment if OOM occurs.
+  • Model unloading after inference in subprocess workers.
 
 Outputs (backward-compatible with FusionEngine contract):
   • outputs/geometry/reconstruction.ply
-  • outputs/geometry/poses.npz
+  • outputs/geometry/poses.npz (with 3DGS-ready intrinsics)
   • outputs/geometry/depth/  (per-frame metric depth maps for TSDF fusion)
-
-3DGS Foundation:
-  All outputs are formatted to serve as initialization for 3D Gaussian
-  Splatting. The poses.npz includes COLMAP-compatible intrinsics, and
-  the per-frame depth maps enable depth-supervised splat initialization.
 """
 
 import gc
 import os
-import shutil
 import sys
 import subprocess
 import time
+import argparse
+import shutil
 
 import torch
 import numpy as np
@@ -41,24 +33,17 @@ import hydra
 from omegaconf import DictConfig
 import matplotlib.pyplot as plt
 import open3d as o3d
+import torchvision.transforms as tvf
 
-from src.video_utils import get_device, find_video, extract_frames
+from src.video_utils import get_device, get_input_data, extract_frames, ingest_photos
 
 
 # ─── MPS Memory Management ──────────────────────────────────────────
 
-
 def _flush_mps_memory():
-    """Aggressively reclaim MPS unified memory.
-
-    On Apple Silicon, GPU and CPU share the same physical RAM.
-    We must explicitly flush the MPS allocator cache AND trigger
-    Python garbage collection to actually reclaim memory.
-    """
+    """Aggressively reclaim MPS unified memory."""
     gc.collect()
     if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        # Synchronize first — MPS operations are async; without this,
-        # Metal may still be computing on buffers we're trying to free.
         if hasattr(torch.mps, "synchronize"):
             torch.mps.synchronize()
         torch.mps.empty_cache()
@@ -66,126 +51,66 @@ def _flush_mps_memory():
         torch.cuda.empty_cache()
 
 
-# ─── VGGT Dependency Management ─────────────────────────────────────
+# ─── DUSt3R Dependency Management ─────────────────────────────────────
 
-
-def setup_vggt():
-    """Ensure the VGGT repository is cloned and on sys.path."""
+def setup_dust3r():
+    """Ensure the DUSt3R repository is cloned and on sys.path."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
-    vggt_path = os.path.join(project_root, "vggt")
+    dust3r_path = os.path.join(project_root, "dust3r")
 
-    if not os.path.exists(vggt_path):
-        print(f"VGGT not found at {vggt_path}. Cloning...")
+    if not os.path.exists(dust3r_path):
+        print(f"DUSt3R not found at {dust3r_path}. Cloning...")
         try:
             subprocess.run(
-                [
-                    "git",
-                    "clone",
-                    "https://github.com/facebookresearch/vggt.git",
-                    vggt_path,
-                ],
+                ["git", "clone", "--recursive", "https://github.com/naver/dust3r", dust3r_path],
                 check=True,
             )
-            # Install in editable mode
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-e", "."],
-                cwd=vggt_path,
-                check=True,
-            )
-            print("VGGT cloned and installed successfully.")
+            print("DUSt3R cloned successfully.")
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Failed to clone/install VGGT: {e}. "
-                "Please run 'git clone https://github.com/facebookresearch/vggt.git' "
-                "and 'pip install -e .' manually."
-            ) from e
+            raise RuntimeError(f"Failed to clone DUSt3R: {e}") from e
 
-    if vggt_path not in sys.path:
-        sys.path.insert(0, vggt_path)
-        print(f"Added {vggt_path} to sys.path")
+    if dust3r_path not in sys.path:
+        sys.path.insert(0, dust3r_path)
+        print(f"Added {dust3r_path} to sys.path")
 
 
 # Run setup BEFORE imports
-setup_vggt()
+setup_dust3r()
 
 try:
-    from vggt.models.vggt import VGGT
-    from vggt.utils.load_fn import load_and_preprocess_images
-    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from dust3r.inference import inference
+    from dust3r.model import AsymmetricCroCo3DStereo
+    from dust3r.image_pairs import make_pairs
+    import dust3r.cloud_opt
+    global_aligner = dust3r.cloud_opt.global_aligner
 except ImportError as e:
-    print(f"VGGT Import Error: {e}")
-    print("Please ensure VGGT is installed: cd vggt && pip install -e .")
+    print(f"DUSt3R Import Error: {e}")
     raise
+
+# Fix for PyTorch 2.6+ weights_only=True default
+if hasattr(torch.serialization, "add_safe_globals"):
+    torch.serialization.add_safe_globals([argparse.Namespace])
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
 
-
 def _to_numpy(x):
-    """Safely convert a tensor or numpy array to a numpy array.
-
-    Immediately moves tensors to CPU to free MPS/CUDA memory.
-    """
+    """Safely convert a tensor or numpy array to a numpy array."""
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().float().numpy()
     return np.asarray(x)
 
 
-def _extrinsic_to_c2w(extrinsic: np.ndarray) -> np.ndarray:
-    """Convert (N, 3, 4) world-from-camera extrinsics to (N, 4, 4) c2w.
-
-    VGGT outputs extrinsics as (B, S, 3, 4) w2c transforms [R|t].
-    We invert to get camera-to-world (c2w) for compatibility with
-    the downstream FusionEngine and renderers.
-    """
-    N = extrinsic.shape[0]
-    c2w = np.zeros((N, 4, 4), dtype=np.float64)
-
-    for i in range(N):
-        # extrinsic[i] is (3, 4) [R|t] = world-to-camera
-        R = extrinsic[i, :3, :3]
-        t = extrinsic[i, :3, 3]
-
-        # Invert: c2w = [R^T | -R^T @ t]
-        R_inv = R.T
-        t_inv = -R_inv @ t
-
-        c2w[i, :3, :3] = R_inv
-        c2w[i, :3, 3] = t_inv
-        c2w[i, 3, 3] = 1.0
-
-    return c2w
-
-
 # ─── Main Engine ─────────────────────────────────────────────────────
 
-
 class GeometryEngineV2:
-    """VGGT-based geometry engine for maximum-quality 3D reconstruction.
-
-    A single forward pass replaces:
-      1. DUSt3R pairwise inference (eliminated: O(N²) → O(1))
-      2. Global alignment (eliminated: 300 iterations → 0)
-
-    Produces metric-scale depth, camera poses, and dense pointmaps.
-
-    Config Levers:
-      • vggt_resolution: Downscale input frames (default 518, VGGT native)
-      • vggt_precision: float32 (max quality) or bfloat16 (half memory)
-      • vggt_chunk_size: Frames per forward pass (default 4; prevents OOM)
-
-    Chunked Inference:
-      ViT attention scales as O(S²) in the sequence dimension.
-      Processing all frames at once causes Metal to request a single
-      12GB+ MTLBuffer allocation, which crashes on M2 (16GB unified).
-      Chunking processes 3-5 frames at a time, keeping peak VRAM ~3GB.
-    """
+    """DUSt3R-based geometry engine with V2 memory logic."""
 
     def __init__(self, cfg: DictConfig):
         self.cfg = cfg
         self.device = get_device(cfg)
-        print(f"GeometryEngineV2 (VGGT) initialized on device: {self.device}")
+        print(f"GeometryEngineV2 (DUSt3R) initialized on device: {self.device}")
 
         self.project_root = (
             hydra.utils.get_original_cwd()
@@ -193,40 +118,25 @@ class GeometryEngineV2:
             else os.getcwd()
         )
 
-        # Determine dtype from config (lever: vggt_precision)
-        # ── MPS bfloat16 → float16 PIVOT ──────────────────────────────
-        # Apple's Metal backend natively supports float16 via its GPU ALUs,
-        # but bfloat16 support is emulated and causes silent type promotion
-        # bugs: internal ops (F.interpolate, BatchNorm) cast intermediates
-        # back to float32 (MPSFloatType), which then collide with bfloat16
-        # weights (MPSBFloat16Type) in F.conv_transpose2d inside the DPT
-        # head. We intercept this at model-load time.
-        precision = cfg.get("vggt_precision", "float32")
-        if precision == "bfloat16" and str(self.device) == "mps":
-            self.dtype = torch.float16
-            print("  Precision: float16 (config requested bfloat16, "
-                  "pivoted to float16 for MPS compatibility)")
-        elif precision == "bfloat16":
-            self.dtype = torch.bfloat16
-            print(f"  Precision: {self.dtype} (config: {precision})")
-        else:
-            self.dtype = torch.float32
-            print(f"  Precision: {self.dtype} (config: {precision})")
+        self.checkpoints_dir = os.path.join(self.project_root, "checkpoints")
+        os.makedirs(self.checkpoints_dir, exist_ok=True)
 
-        # VGGT input resolution (lever: vggt_resolution)
-        self.vggt_resolution = cfg.get("vggt_resolution", 518)
-        print(f"  VGGT input resolution: {self.vggt_resolution}")
+        model_name = "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+        model_path = os.path.join(self.checkpoints_dir, model_name)
+        model_url = "https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
 
-        # Chunk size for batched inference (lever: vggt_chunk_size)
-        self.chunk_size = cfg.get("vggt_chunk_size", 4)
-        print(f"  Chunk size: {self.chunk_size} frames per forward pass")
+        if not os.path.exists(model_path):
+            print(f"Downloading DUSt3R from {model_url}...")
+            torch.hub.download_url_to_file(model_url, model_path)
+            print("Download complete.")
 
-        # Load VGGT model
-        print("Loading VGGT-1B model from Hugging Face...")
+        print(f"Loading DUSt3R model...")
         t0 = time.time()
-        self.model = VGGT.from_pretrained("facebook/VGGT-1B")
-        self.model = self.model.to(device=self.device, dtype=self.dtype).eval()
+        # MPS Fix: Load to CPU first
+        self.model = AsymmetricCroCo3DStereo.from_pretrained(model_path).to("cpu")
+        self.model = self.model.to(self.device).eval()
         print(f"  Model loaded in {time.time() - t0:.1f}s")
+        _flush_mps_memory()
 
         # Output directories
         self.geo_dir = os.path.join(self.project_root, "outputs", "geometry")
@@ -234,388 +144,194 @@ class GeometryEngineV2:
         os.makedirs(self.geo_dir, exist_ok=True)
         os.makedirs(self.depth_dir, exist_ok=True)
 
-    def _prepare_frame_pngs(self, frames: list[np.ndarray]) -> list[str]:
-        """Save frames as temporary PNGs for VGGT's preprocessor.
-
-        Applies the vggt_resolution downscale if configured.
-        Returns list of file paths.
-        """
-        tmp_dir = os.path.join(self.geo_dir, "_tmp_vggt_input")
-        os.makedirs(tmp_dir, exist_ok=True)
-
-        image_paths = []
-        for i, frame in enumerate(frames):
-            if self.vggt_resolution and self.vggt_resolution < frame.shape[0]:
-                frame = cv2.resize(
-                    frame,
-                    (self.vggt_resolution, self.vggt_resolution),
-                    interpolation=cv2.INTER_AREA,
-                )
-            path = os.path.join(tmp_dir, f"{i:05d}.png")
-            cv2.imwrite(path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            image_paths.append(path)
-
-        return image_paths
-
-    def run_inference(self, frames: list[np.ndarray]) -> dict:
-        """Run VGGT inference on extracted frames using chunked processing.
-
-        Because VGGT is a Vision Transformer, the attention matrix scales
-        quadratically with sequence length S. Processing all frames at once
-        (e.g., 15 frames) requests a ~12GB Metal buffer allocation that
-        crashes Apple's MPS backend.
-
-        Solution: Process frames in chunks of `vggt_chunk_size` (default 4).
-        Each chunk runs through VGGT independently, results are immediately
-        moved to CPU numpy, and MPS memory is flushed between chunks.
-
-        Args:
-            frames: List of RGB numpy arrays (H, W, 3) uint8.
-
-        Returns:
-            Dictionary with c2w, intrinsics, depth_maps, point_maps,
-            all as numpy arrays (on CPU — MPS memory freed).
-            Returns None if resume cache hit.
-        """
+    def run_inference(self, frames: list[np.ndarray]):
+        """Run DUSt3R inference in 'complete' mode with OOM fallback."""
         ply_path = os.path.join(self.geo_dir, "reconstruction.ply")
         poses_path = os.path.join(self.geo_dir, "poses.npz")
         resume = self.cfg.get("resume", True)
 
-        # ─── SKIP LOGIC ─────────────────────────────────────────────
         if resume and os.path.exists(ply_path) and os.path.exists(poses_path):
-            depth_files = (
-                [f for f in os.listdir(self.depth_dir) if f.endswith(".npy")]
-                if os.path.exists(self.depth_dir)
-                else []
-            )
+            depth_files = []
+            if os.path.exists(self.depth_dir):
+                depth_files = [f for f in os.listdir(self.depth_dir) if f.endswith(".npy")]
             if len(depth_files) > 0:
                 print(">> Found completed geometry output. Skipping inference.")
-                print(f"   PLY: {ply_path}")
-                print(f"   Poses: {poses_path}")
-                print(f"   Depth maps: {len(depth_files)} files")
-                print("   (Delete these files to re-run VGGT)")
                 return None
 
-        # ─── PREPARE FRAME FILES ─────────────────────────────────────
         N = len(frames)
-        print(
-            f"\nRunning VGGT chunked inference on {N} frames "
-            f"(chunk_size={self.chunk_size})..."
-        )
+        print(f"\nRunning DUSt3R 'complete' pairs inference on {N} frames...")
         t0 = time.time()
 
-        image_paths = self._prepare_frame_pngs(frames)
+        # ─── PART A: PAIRWISE INFERENCE ─────────────────────────────────
+        normalize = tvf.Compose([
+            tvf.ToTensor(), 
+            tvf.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
 
-        # ─── CHUNKED INFERENCE ───────────────────────────────────────
-        # Process frames in chunks to avoid quadratic attention OOM.
-        # Each chunk is a separate forward pass through VGGT.
-        all_extrinsics = []  # list of (chunk_S, 3, 4) numpy
-        all_intrinsics = []  # list of (chunk_S, 3, 3) numpy
-        all_depth_maps = []  # list of (chunk_S, H, W) numpy
-        all_point_maps = []  # list of (chunk_S, H, W, 3) numpy
-        image_hw = None  # (H, W) from VGGT preprocessing
+        dust3r_frames = []
+        for i, frame in enumerate(frames):
+            img_tensor = normalize(frame).unsqueeze(0)
+            dust3r_frames.append({
+                "img": img_tensor,
+                "true_shape": np.array([frame.shape[:2]], dtype=np.int32),
+                "idx": i,
+                "instance": str(i),
+            })
 
-        num_chunks = (N + self.chunk_size - 1) // self.chunk_size
+        # ACCURACY DIRECTIVE: Use "complete" (all-pairs) instead of swin sparse matching
+        print(f"Generating All-Pairs complete connectivity graph...")
+        pairs = make_pairs(dust3r_frames, scene_graph="complete", prefilter=None, symmetrize=True)
 
-        # Resolve the model's actual weight dtype ONCE (after any
-        # bfloat16→float16 pivot that happened in __init__).
-        model_dtype = next(self.model.parameters()).dtype
+        print(f"Processing {len(pairs)} pairs... (batch_size=1)")
+        output = inference(pairs, self.model, self.device, batch_size=1)
+        
+        # Aggressive memory flush post-inference because Global Alignment is heavy
+        del pairs, dust3r_frames
+        _flush_mps_memory()
+        print("✅ Pairwise inference complete. Flushed MPS memory.")
 
-        # Determine autocast device type for the forward pass.
-        # torch.autocast catches stray float32 intermediates produced by
-        # F.interpolate / BatchNorm inside VGGT's DPT head and casts them
-        # back to the target precision before they hit conv_transpose2d.
-        autocast_device = "mps" if str(self.device) == "mps" else (
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        # ─── PART B: GLOBAL ALIGNMENT ───────────────────────────────────
+        print("Running Global Alignment...")
+        scene = global_aligner(output, device=self.device, optimize_pp=False)
 
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * self.chunk_size
-            end = min(start + self.chunk_size, N)
-            chunk_paths = image_paths[start:end]
-            chunk_len = end - start
-
-            print(
-                f"\n  [Chunk {chunk_idx + 1}/{num_chunks}] "
-                f"Frames {start}–{end - 1} ({chunk_len} frames)"
-            )
-
-            # Load and preprocess this chunk (NOT all image_paths!)
-            # Cast to the model's exact weight dtype for strict type parity.
-            images = load_and_preprocess_images(chunk_paths).to(
-                device=self.device, dtype=model_dtype
-            )
-            # images shape: (1, chunk_S, 3, H, W)
-
-            # Capture the spatial dimensions (same for all chunks)
-            if image_hw is None:
-                image_hw = images.shape[-2:]  # (H, W)
-
-            # Forward pass with autocast to prevent stray float32
-            # intermediates from colliding with float16/bfloat16 weights
-            # inside the DPT head's conv_transpose2d.
-            with torch.no_grad(), torch.autocast(
-                device_type=autocast_device, dtype=model_dtype
-            ):
-                predictions = self.model(images)
-
-            # ─── EXTRACT TO CPU IMMEDIATELY ──────────────────────────
-            chunk_hw = images.shape[-2:]
-
-            # Camera poses
-            extr, intr = pose_encoding_to_extri_intri(predictions["pose_enc"], chunk_hw)
-            all_extrinsics.append(_to_numpy(extr[0]))  # (chunk_S, 3, 4)
-            all_intrinsics.append(_to_numpy(intr[0]))  # (chunk_S, 3, 3)
-
-            # Depth maps
-            all_depth_maps.append(_to_numpy(predictions["depth"][0]))  # (chunk_S, H, W)
-
-            # Point maps
-            all_point_maps.append(
-                _to_numpy(predictions["world_points"][0])  # (chunk_S, H, W, 3)
-            )
-
-            # ─── FLUSH MPS MEMORY BETWEEN CHUNKS ────────────────────
-            del images, predictions, extr, intr
-            _flush_mps_memory()
-            print(f"    🧹 Chunk {chunk_idx + 1} complete, MPS flushed")
+        try:
+            scene.compute_global_alignment(init="mst", niter=300, schedule="linear", lr=0.01)
+            print(f"✅ Global alignment complete on {self.device}.")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() or "mps" in str(e).lower():
+                print("⚠️  OOM detected on MPS. Moving scene to CPU for Global Alignment...")
+                print("   (This will be slower but avoids crashing)")
+                _flush_mps_memory()
+                scene = scene.to("cpu")
+                scene.compute_global_alignment(init="mst", niter=300, schedule="linear", lr=0.01)
+                print("✅ Global alignment complete on CPU (OOM fallback).")
+            else:
+                raise
 
         elapsed = time.time() - t0
-        print(
-            f"\n✅ VGGT chunked inference complete in {elapsed:.2f}s "
-            f"({num_chunks} chunks)"
-        )
-
-        # ─── CONCATENATE CHUNK RESULTS ON CPU ────────────────────────
-        extrinsics = np.concatenate(all_extrinsics, axis=0)  # (N, 3, 4)
-        intrinsics = np.concatenate(all_intrinsics, axis=0)  # (N, 3, 3)
-        depth_maps = np.concatenate(all_depth_maps, axis=0)  # (N, H, W)
-        point_maps = np.concatenate(all_point_maps, axis=0)  # (N, H, W, 3)
-
-        # Free the chunk lists
-        del all_extrinsics, all_intrinsics, all_depth_maps, all_point_maps
-        gc.collect()
-
-        # Convert w2c extrinsics to c2w
-        c2w = _extrinsic_to_c2w(extrinsics)  # (N, 4, 4)
-
-        # Clean up temporary input files
-        shutil.rmtree(
-            os.path.join(self.geo_dir, "_tmp_vggt_input"),
-            ignore_errors=True,
-        )
-
-        result = {
-            "c2w": c2w,
-            "intrinsics": intrinsics,
-            "depth_maps": depth_maps,
-            "point_maps": point_maps,
-            "image_hw": (int(image_hw[0]), int(image_hw[1])),
-        }
-
-        print(f"  Cameras: {c2w.shape[0]} poses")
-        print(f"  Depth maps: {depth_maps.shape}")
-        print(f"  Point maps: {point_maps.shape}")
-
-        return result
+        print(f"\n✅ DUSt3R inference & alignment complete in {elapsed:.2f}s")
+        return scene
 
     def unload_model(self):
-        """Explicitly unload the VGGT model to free ~4GB of unified memory.
-
-        Call this after inference is complete and before launching
-        another heavy model (e.g., SAM 2).
-        """
+        """Explicitly unload the DUSt3R model to free unified memory."""
         if hasattr(self, "model") and self.model is not None:
             del self.model
             self.model = None
             _flush_mps_memory()
-            print("  🧹 VGGT model unloaded, memory freed")
+            print("  🧹 DUSt3R model unloaded, memory freed")
 
-    def save_outputs(self, result: dict, frames: list[np.ndarray]) -> None:
-        """Save point cloud, camera poses, depth maps, and visualization.
-
-        Outputs are formatted to serve as 3DGS initialization:
-          • poses.npz with COLMAP-compatible intrinsics (fx, fy, cx, cy)
-          • Per-frame metric depth maps as .npy files
-          • Dense colored point cloud as .ply
-
-        Memory-optimized: processes frames one at a time and frees
-        intermediate arrays to avoid holding N copies in memory.
-        """
-        if result is None:
-            print(">> Outputs already exist. Skipping save_outputs.")
+    def save_outputs(self, scene, frames: list[np.ndarray]) -> None:
+        """Save outputs using DUSt3R scene, matching V2's 3DGS format."""
+        if scene is None:
             return
 
-        c2w = result["c2w"]
-        intrinsics = result["intrinsics"]
-        depth_maps = result["depth_maps"]
-        point_maps = result["point_maps"]
-        image_hw = result["image_hw"]
-
-        N = c2w.shape[0]
-        H, W = image_hw
-
+        N = len(frames)
+        
         # ── 1. Save Dense Point Cloud ────────────────────────────────
         ply_path = os.path.join(self.geo_dir, "reconstruction.ply")
         print(f"Saving point cloud to {ply_path}...")
 
+        pts_list = scene.get_pts3d()
+        imgs_list = scene.imgs
+
         all_pts = []
         all_cols = []
 
-        for i in range(N):
-            pts = point_maps[i].reshape(-1, 3)  # (H*W, 3)
+        for i in range(len(pts_list)):
+            p = _to_numpy(pts_list[i]).reshape(-1, 3)
+            c = _to_numpy(imgs_list[i]).reshape(-1, 3)
+            valid = np.isfinite(p).all(axis=1) # Mask invalids
+            all_pts.append(p[valid])
+            all_cols.append(c[valid])
 
-            # Get colors from the original frames (resize to match VGGT output)
-            frame_resized = cv2.resize(frames[i], (W, H))
-            cols = frame_resized.reshape(-1, 3).astype(np.float64) / 255.0
-
-            # Filter out invalid points (NaN, Inf, zero-depth)
-            valid = np.isfinite(pts).all(axis=1) & (depth_maps[i].reshape(-1) > 0.01)
-            all_pts.append(pts[valid])
-            all_cols.append(cols[valid])
-
-        # Free point_maps now that we've extracted what we need
-        del point_maps
-        result["point_maps"] = None
-        gc.collect()
+        # Release tensors from scene early to manage memory
+        del pts_list, imgs_list
+        _flush_mps_memory()
 
         all_pts = np.concatenate(all_pts, axis=0)
-        all_cols = np.concatenate(all_cols, axis=0)
-        all_cols = np.clip(all_cols, 0.0, 1.0)
+        all_cols = np.clip(np.concatenate(all_cols, axis=0), 0.0, 1.0)
 
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(all_pts.astype(np.float64))
         pcd.colors = o3d.utility.Vector3dVector(all_cols.astype(np.float64))
 
-        success = o3d.io.write_point_cloud(ply_path, pcd)
-        if success:
-            file_size = os.path.getsize(ply_path)
-            print(
-                f"✅ Point cloud saved: {ply_path} "
-                f"({all_pts.shape[0]:,} points, {file_size / 1024:.1f} KB)"
-            )
-        else:
-            print(f"❌ Failed to write point cloud to {ply_path}")
-
-        # Free the concatenated arrays
+        o3d.io.write_point_cloud(ply_path, pcd)
+        print(f"✅ Point cloud saved: {all_pts.shape[0]:,} points")
+        
         del all_pts, all_cols, pcd
-        gc.collect()
+        _flush_mps_memory()
 
-        # ── 2. Save Camera Poses (3DGS-compatible) ───────────────────
+        # ── 2. Save Camera Poses (3DGS-ready) ─────────────────────────
         poses_path = os.path.join(self.geo_dir, "poses.npz")
-        print(f"Saving camera poses to {poses_path}...")
+        c2w = _to_numpy(scene.get_im_poses())
+        focals = _to_numpy(scene.get_focals())
+        if focals.ndim == 2:
+            focals = focals.mean(axis=1)
+            
+        pp = _to_numpy(scene.get_principal_points())
 
-        # Extract per-camera focal lengths and principal points from
-        # the VGGT intrinsic matrices K = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
-        fx = intrinsics[:, 0, 0]  # (N,)
-        fy = intrinsics[:, 1, 1]  # (N,)
-        cx = intrinsics[:, 0, 2]  # (N,)
-        cy = intrinsics[:, 1, 2]  # (N,)
+        intrinsics = np.zeros((N, 3, 3))
+        fx, fy, cx, cy = np.zeros(N), np.zeros(N), np.zeros(N), np.zeros(N)
+        for i in range(N):
+            fx[i], fy[i] = focals[i], focals[i]
+            cx[i], cy[i] = pp[i, 0], pp[i, 1]
+            intrinsics[i] = np.array([[fx[i], 0, cx[i]], [0, fy[i], cy[i]], [0, 0, 1]])
 
-        # For backward compat with FusionEngine: average fx/fy as "focals"
-        focals = (fx + fy) / 2.0
-
-        # Principal points as (N, 2) array
-        principal_points = np.stack([cx, cy], axis=1)
-
-        # Frame filenames from the processed frames dir
-        frames_dir = os.path.join(
-            self.project_root, self.cfg.dataset.processed_frames_dir
-        )
+        frames_dir = os.path.join(self.project_root, self.cfg.dataset.processed_frames_dir)
         image_names = sorted([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
-
-        # Image shapes
-        image_shapes = np.array([[H, W]] * N)
+        image_shapes = np.array([[frames[0].shape[0], frames[0].shape[1]]] * N)
 
         np.savez_compressed(
             poses_path,
             c2w=c2w,
             focals=focals,
-            principal_points=principal_points,
+            principal_points=pp,
             image_names=np.array(image_names),
             image_shapes=image_shapes,
-            # 3DGS-specific: full intrinsic matrices for splat initialization
             intrinsics=intrinsics,
-            fx=fx,
-            fy=fy,
-            cx=cx,
-            cy=cy,
-            # Metadata
-            source_resolution=np.array([H, W]),
-            geometry_backend="vggt-1b",
+            fx=fx, fy=fy, cx=cx, cy=cy,
+            source_resolution=image_shapes[0],
+            geometry_backend="dust3r-allpairs"
         )
+        print(f"✅ Camera poses saved: {poses_path}")
 
-        print(
-            f"✅ Camera poses saved: {poses_path} ({N} cameras, 3DGS-ready intrinsics)"
-        )
-
-        # ── 3. Save Per-Frame Metric Depth Maps ─────────────────────
-        # These are critical for:
-        #   a) TSDF volumetric fusion in FusionEngine
-        #   b) Depth-supervised 3DGS initialization
+        # ── 3. Save Depth Maps ─────────────────────────────────────────
         print(f"Saving {N} depth maps to {self.depth_dir}/...")
-        for i in range(N):
+        depthmaps = scene.get_depthmaps()
+        for i, d in enumerate(depthmaps):
+            d_np = _to_numpy(d)
             depth_path = os.path.join(self.depth_dir, f"{i:05d}_depth.npy")
-            np.save(depth_path, depth_maps[i].astype(np.float32))
-
-        print(f"✅ Depth maps saved: {self.depth_dir}/ ({N} files)")
-
-        # ── 4. Save Visualization ────────────────────────────────────
-        viz_path = os.path.join(self.geo_dir, "visualization.png")
-        print(f"Saving visualization to {viz_path}...")
-
-        try:
-            img0 = frames[0]
-            depth_viz = depth_maps[0]
-
-            # Normalize for display
-            d_valid = depth_viz[depth_viz > 0]
-            if len(d_valid) > 0:
-                d_min, d_max = np.percentile(d_valid, [1, 99])
-                depth_norm = np.clip((depth_viz - d_min) / (d_max - d_min + 1e-6), 0, 1)
-            else:
-                depth_norm = np.zeros_like(depth_viz)
-
-            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-            axes[0].imshow(img0)
-            axes[0].set_title("Input Frame 0")
-            axes[0].axis("off")
-
-            axes[1].imshow(depth_norm, cmap="magma")
-            axes[1].set_title("VGGT Metric Depth")
-            axes[1].axis("off")
-
-            plt.tight_layout()
-            plt.savefig(viz_path, dpi=150)
-            plt.close()
-            print(f"✅ Visualization saved: {viz_path}")
-        except Exception as e:
-            print(f"❌ Error saving visualization: {e}")
+            np.save(depth_path, d_np.astype(np.float32))
+        
+        del depthmaps
+        _flush_mps_memory()
+        print(f"✅ Depth maps saved.")
 
 
 # ─── CLI Entry Point ─────────────────────────────────────────────────
 
-
 @hydra.main(version_base=None, config_path="../", config_name="config")
 def main(cfg: DictConfig):
     from src.config_presets import apply_preset
-
     cfg = apply_preset(cfg)
 
     engine = GeometryEngineV2(cfg)
-
-    video_path = find_video(cfg, engine.project_root)
-    print(f"Processing video: {video_path}")
-
-    frames, frames_dir = extract_frames(video_path, cfg, engine.project_root)
+    mode, data_path = get_input_data(cfg, engine.project_root)
+    
+    if mode == "photos":
+        print(f"Processing photo directory: {data_path}")
+        frames, frames_dir = ingest_photos(data_path, cfg, engine.project_root)
+    else:
+        print(f"Processing video: {data_path}")
+        frames, frames_dir = extract_frames(data_path, cfg, engine.project_root)
+        
     if not frames:
         print("No frames extracted.")
         return
 
-    result = engine.run_inference(frames)
-    engine.save_outputs(result, frames)
+    scene = engine.run_inference(frames)
+    engine.save_outputs(scene, frames)
     engine.unload_model()
-
 
 if __name__ == "__main__":
     main()
